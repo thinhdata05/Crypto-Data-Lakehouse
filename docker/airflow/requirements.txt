@@ -1,0 +1,6 @@
+pyarrow>=15.0.0
+pandas>=2.1.0
+pendulum>=2.1.2
+psycopg2-binary>=2.9.9
+pydantic>=2.0.0
+fastparquet>=2024.2.0

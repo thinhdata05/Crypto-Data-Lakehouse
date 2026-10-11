@@ -1,0 +1,40 @@
+# =========================
+# Secrets / environment
+# =========================
+.env
+.env.*
+!.env.example
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.ipynb_checkpoints/
+
+# =========================
+# Airflow runtime & logs
+# =========================
+logs/
+airflow_logs/
+
+# =========================
+# Data / Lakehouse Storage
+# =========================
+raw/
+warehouse/
+*.parquet
+tmp/
+temp/
+*.tmp
+
+# =========================
+# IDE & OS
+# =========================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

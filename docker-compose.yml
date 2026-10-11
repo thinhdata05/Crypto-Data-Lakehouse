@@ -1,0 +1,250 @@
+networks:
+  lakehouse-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  minio_data:
+  warehouse_data:
+  airflow_logs:
+
+services:
+
+  # ============================================================================
+  # MinIO Object Storage (Local S3)
+  # ============================================================================
+  minio:
+    image: quay.io/minio/minio:latest
+    container_name: lakehouse-minio
+    networks:
+      lakehouse-net:
+        aliases:
+          - minio
+          - warehouse.minio
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-admin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-password}
+      - MINIO_DOMAIN=minio
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    command: ["server", "/data", "--console-address", ":9001"]
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ============================================================================
+  # MinIO Client - Initialize Buckets
+  # ============================================================================
+  mc:
+    image: quay.io/minio/mc:latest
+    container_name: lakehouse-mc
+    networks:
+      - lakehouse-net
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER:-admin}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD:-password}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+    entrypoint: |
+      /bin/sh -c "
+      until (/usr/bin/mc alias set minio http://minio:9000 ${MINIO_ROOT_USER:-admin} ${MINIO_ROOT_PASSWORD:-password}) do
+        echo 'Waiting for MinIO...' && sleep 1;
+      done;
+      /usr/bin/mc mb --ignore-existing minio/warehouse;
+      /usr/bin/mc mb --ignore-existing minio/lakehouse;
+      /usr/bin/mc policy set public minio/warehouse || true;
+      /usr/bin/mc policy set public minio/lakehouse || true;
+      echo 'MinIO buckets (warehouse, lakehouse) created successfully.';
+      "
+    restart: "no"
+
+  # ============================================================================
+  # Apache Iceberg REST Catalog
+  # ============================================================================
+  rest:
+    image: apache/iceberg-rest-fixture:latest
+    container_name: lakehouse-iceberg-rest
+    networks:
+      lakehouse-net:
+        aliases:
+          - rest
+          - iceberg-rest
+    ports:
+      - "${ICEBERG_REST_PORT:-8181}:8181"
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-admin}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-password}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - CATALOG_WAREHOUSE=s3://warehouse/
+      - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+      - CATALOG_S3_ENDPOINT=http://minio:9000
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ============================================================================
+  # Apache Spark with Iceberg Runtime & Jupyter
+  # ============================================================================
+  spark-iceberg:
+    image: tabulario/spark-iceberg:latest
+    container_name: lakehouse-spark-iceberg
+    networks:
+      lakehouse-net:
+        aliases:
+          - spark-iceberg
+    depends_on:
+      - rest
+      - minio
+    ports:
+      - "${JUPYTER_PORT:-8888}:8888"
+      - "${SPARK_UI_PORT:-8080}:8080"
+      - "${SPARK_THRIFT_PORT:-10000}:10000"
+      - "10001:10001"
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-admin}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-password}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - APCA_API_KEY_ID=${APCA_API_KEY_ID:-}
+      - APCA_API_SECRET_KEY=${APCA_API_SECRET_KEY:-}
+      - SPARK_MASTER_OPTS=-Dspark.deploy.defaultCores=2
+    volumes:
+      - warehouse_data:/home/iceberg/warehouse
+      - ./warehouse:/home/iceberg/warehouse_local
+      - ./notebooks:/home/iceberg/notebooks/notebooks
+      - ./src:/home/iceberg/src
+      - ./raw:/home/iceberg/raw
+      - ./sql:/home/iceberg/sql
+      - ./tests:/home/iceberg/tests
+      - ./config/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+    restart: unless-stopped
+
+  # ============================================================================
+  # PostgreSQL (Airflow Metadata Database)
+  # ============================================================================
+  postgres:
+    image: postgres:16
+    container_name: lakehouse-postgres
+    networks:
+      lakehouse-net:
+        aliases:
+          - postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-airflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-airflow}
+      POSTGRES_DB: ${POSTGRES_DB:-airflow}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-airflow} -d ${POSTGRES_DB:-airflow}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ============================================================================
+  # Airflow Init
+  # ============================================================================
+  airflow-init:
+    build:
+      context: .
+      dockerfile: ./docker/airflow/Dockerfile
+    container_name: lakehouse-airflow-init
+    networks:
+      - lakehouse-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@postgres:5432/${POSTGRES_DB:-airflow}
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__FERNET_KEY: "${AIRFLOW_FERNET_KEY:-46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqBpPo=}"
+    command: >
+      bash -c "
+        airflow db migrate &&
+        airflow users create --username ${AIRFLOW_ADMIN_USERNAME:-admin} --password ${AIRFLOW_ADMIN_PASSWORD:-admin} --firstname admin --lastname admin --role Admin --email ${AIRFLOW_ADMIN_EMAIL:-admin@lakehouse.local} || true
+      "
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./src:/opt/airflow/src
+      - airflow_logs:/opt/airflow/logs
+    restart: "no"
+
+  # ============================================================================
+  # Airflow Webserver
+  # ============================================================================
+  airflow-webserver:
+    build:
+      context: .
+      dockerfile: ./docker/airflow/Dockerfile
+    container_name: lakehouse-airflow-webserver
+    networks:
+      - lakehouse-net
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    command: webserver
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@postgres:5432/${POSTGRES_DB:-airflow}
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__FERNET_KEY: "${AIRFLOW_FERNET_KEY:-46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqBpPo=}"
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+      APCA_API_KEY_ID: "${APCA_API_KEY_ID:-}"
+      APCA_API_SECRET_KEY: "${APCA_API_SECRET_KEY:-}"
+    ports:
+      - "${AIRFLOW_WEBSERVER_PORT:-8085}:8080"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./src:/opt/airflow/src
+      - ./raw:/opt/airflow/raw
+      - ./warehouse:/opt/airflow/warehouse
+      - /var/run/docker.sock:/var/run/docker.sock
+      - airflow_logs:/opt/airflow/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # ============================================================================
+  # Airflow Scheduler
+  # ============================================================================
+  airflow-scheduler:
+    build:
+      context: .
+      dockerfile: ./docker/airflow/Dockerfile
+    container_name: lakehouse-airflow-scheduler
+    networks:
+      - lakehouse-net
+    depends_on:
+      airflow-webserver:
+        condition: service_healthy
+    command: scheduler
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@postgres:5432/${POSTGRES_DB:-airflow}
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__FERNET_KEY: "${AIRFLOW_FERNET_KEY:-46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqBpPo=}"
+      APCA_API_KEY_ID: "${APCA_API_KEY_ID:-}"
+      APCA_API_SECRET_KEY: "${APCA_API_SECRET_KEY:-}"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./src:/opt/airflow/src
+      - ./raw:/opt/airflow/raw
+      - ./warehouse:/opt/airflow/warehouse
+      - /var/run/docker.sock:/var/run/docker.sock
+      - airflow_logs:/opt/airflow/logs
+    restart: unless-stopped

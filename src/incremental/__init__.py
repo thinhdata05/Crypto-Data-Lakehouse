@@ -1,0 +1,1 @@
+"""Incremental ingestion module."""
