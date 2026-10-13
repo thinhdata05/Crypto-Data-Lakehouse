@@ -94,14 +94,15 @@ def record_manifest_entry(
 
 
 def is_file_already_ingested(catalog, source_file: str, file_hash: str) -> bool:
-    """Checks if a source file with matching hash has already been recorded in the manifest."""
+    """Checks if a source file with matching content hash has already been recorded in the manifest."""
     try:
         manifest_tbl = catalog.load_table("bronze.source_manifest")
         if not manifest_tbl.current_snapshot():
             return False
+        # Filter by file_hash (content fingerprint) for path-independent deduplication
         scan = manifest_tbl.scan(
-            row_filter=And(EqualTo("source_file", source_file), EqualTo("file_hash", file_hash)),
-            selected_fields=("source_file",),
+            row_filter=EqualTo("file_hash", file_hash),
+            selected_fields=("file_hash", "source_file"),
         )
         return len(scan.to_arrow()) > 0
     except Exception:

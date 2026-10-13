@@ -1,11 +1,12 @@
 """
-Integration Test Suite: Iceberg Table Overwrite & Idempotent Replay Contracts.
+Integration Test Suite: Iceberg Table Overwrite, Replay Idempotency & Serving API Contracts.
 
 Validates:
 1. Target table atomic overwrite (tbl.overwrite(..., overwrite_filter=...)) produces identical
    row count upon multiple backfill replays (zero duplicate accumulation).
 2. Partition-pruned / symbol-scoped overwrite leaves other symbols untouched.
 3. Live interaction with Apache Iceberg REST Catalog and MinIO S3 storage.
+4. Happy-path verification of query_minute_spread() bounded serving API with partition pushdown.
 """
 
 from __future__ import annotations
@@ -15,16 +16,22 @@ import os
 import sys
 import unittest
 
-import pyarrow as pa
-from pyiceberg.catalog import load_catalog
-from pyiceberg.expressions import And, EqualTo
-from pyiceberg.partitioning import PartitionField, PartitionSpec
-from pyiceberg.schema import Schema
-from pyiceberg.transforms import DayTransform
-from pyiceberg.types import DoubleType, NestedField, StringType, TimestampType
+try:
+    import pyarrow as pa
+    from pyiceberg.catalog import load_catalog
+    from pyiceberg.expressions import And, EqualTo
+    from pyiceberg.partitioning import PartitionField, PartitionSpec
+    from pyiceberg.schema import Schema
+    from pyiceberg.transforms import DayTransform
+    from pyiceberg.types import DoubleType, NestedField, StringType, TimestampType
+    HAS_PYICEBERG = True
+except ImportError:
+    HAS_PYICEBERG = False
 
 
 def get_test_catalog():
+    if not HAS_PYICEBERG:
+        return None
     rest_uri = os.getenv("ICEBERG_REST_URI", "http://rest:8181")
     s3_endpoint = os.getenv("MINIO_ENDPOINT", "http://minio:9000")
     s3_access_key = os.getenv("AWS_ACCESS_KEY_ID", "admin")
@@ -50,10 +57,17 @@ def get_test_catalog():
 class TestIcebergIdempotencyIntegration(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        if not HAS_PYICEBERG:
+            return
         cls.catalog = get_test_catalog()
         cls.table_name = "silver.test_idempotent_replay_contract"
 
     def setUp(self):
+        if not HAS_PYICEBERG:
+            self.skipTest(
+                "pyiceberg is not installed in the local host environment. "
+                "Run tests inside Docker: docker exec -w /home/iceberg lakehouse-spark-iceberg python -m unittest discover tests"
+            )
         if not self.catalog:
             self.skipTest("Iceberg REST catalog is not accessible in current environment.")
         # Ensure clean state
@@ -63,7 +77,7 @@ class TestIcebergIdempotencyIntegration(unittest.TestCase):
             pass
 
     def tearDown(self):
-        if self.catalog:
+        if HAS_PYICEBERG and self.catalog:
             try:
                 self.catalog.drop_table(self.table_name)
             except Exception:
@@ -186,6 +200,59 @@ class TestIcebergIdempotencyIntegration(unittest.TestCase):
         btc_rows = all_res[all_res["raw_symbol"] == "BTCUSDT"]
         self.assertEqual(len(btc_rows), 2)
         self.assertEqual(list(btc_rows["close"]), [55000.0, 55100.0], "BTCUSDT records must be updated")
+
+    def test_query_minute_spread_happy_path_live(self):
+        """
+        Happy-Path Test: Verifies query_minute_spread() retrieves and aligns
+        minute bars for a valid 1-day window against live Iceberg curated gold tables,
+        confirming that ISO string timestamp pushdown filtering works accurately.
+        """
+        from src.serving.query_minute_spread import query_minute_spread
+
+        try:
+            gold_tbl = self.catalog.load_table("gold.curated_crypto_bars")
+            if not gold_tbl.current_snapshot():
+                self.skipTest("gold.curated_crypto_bars has no snapshot")
+        except Exception:
+            self.skipTest("Cannot connect to gold.curated_crypto_bars")
+
+        # Query 1-day interval
+        start_time = "2026-08-10T00:00:00Z"
+        end_time = "2026-08-11T00:00:00Z"
+
+        res = query_minute_spread(
+            base_currency="BTC",
+            start_time=start_time,
+            end_time=end_time,
+            catalog=self.catalog,
+        )
+
+        self.assertGreater(len(res), 0, "Should retrieve aligned minute bars for BTC in the specified 1-day window")
+
+        expected_cols = [
+            "base_currency",
+            "timestamp",
+            "alpaca_close",
+            "alpaca_volume",
+            "binance_close_raw",
+            "binance_volume",
+            "binance_quote",
+            "usdt_rate_usd",
+            "binance_close_usd",
+            "spread_usd",
+            "spread_pct",
+        ]
+        for col in expected_cols:
+            self.assertIn(col, res.column_names, f"Expected column '{col}' in minute spread result")
+
+        # Assert partition pushdown correctness: all timestamps within [start, end]
+        timestamps = res["timestamp"].to_pylist()
+        dt_start = datetime.fromisoformat("2026-08-10T00:00:00+00:00")
+        dt_end = datetime.fromisoformat("2026-08-11T00:00:00+00:00")
+        self.assertTrue(
+            all(dt_start <= ts <= dt_end for ts in timestamps),
+            "All timestamps must strictly lie within the requested window bounds"
+        )
 
 
 if __name__ == "__main__":

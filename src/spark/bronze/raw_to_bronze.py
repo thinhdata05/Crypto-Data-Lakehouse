@@ -36,6 +36,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional batch filter",
     )
+    parser.add_argument(
+        "--force-replay",
+        action="store_true",
+        help="Force re-ingestion of already processed files (bypasses manifest check)",
+    )
     return parser.parse_args()
 
 
@@ -121,46 +126,62 @@ def main() -> None:
             if not parquet_files:
                 continue
 
-            # Load dataset via PyArrow
-            dataset = ds.dataset(parquet_files, format="parquet")
-            arrow_tbl = dataset.to_table()
-            rows_count = len(arrow_tbl)
+            from src.utils.manifest_tracker import (
+                compute_file_sha256,
+                is_file_already_ingested,
+                record_manifest_entry,
+            )
 
-            if rows_count == 0:
-                continue
+            sym_ingested = 0
+            sym_skipped = 0
 
-            # Append ingested_at timestamp column
-            now_utc = datetime.now(timezone.utc)
-            arrow_tbl = arrow_tbl.append_column("ingested_at", pa.repeat(now_utc, rows_count))
+            for p_file in parquet_files:
+                file_name = os.path.basename(p_file)
+                f_hash = compute_file_sha256(p_file) if os.path.exists(p_file) else None
+                if not f_hash:
+                    continue
 
-            # PyIceberg streaming append to Bronze
-            table.append(arrow_tbl)
-            total_ingested += rows_count
+                # Idempotency Gate: Skip already ingested files based on SHA-256 content hash
+                if not args.force_replay and is_file_already_ingested(catalog, p_file, f_hash):
+                    sym_skipped += 1
+                    continue
+
+                import pyarrow.parquet as pq
+                file_tbl = pq.read_table(p_file)
+                rows_count = len(file_tbl)
+                if rows_count == 0:
+                    continue
+
+                now_utc = datetime.now(timezone.utc)
+                file_tbl = file_tbl.append_column("ingested_at", pa.repeat(now_utc, rows_count))
+
+                # PyIceberg streaming append to Bronze
+                table.append(file_tbl)
+                total_ingested += rows_count
+                sym_ingested += rows_count
+
+                # Record granular checkpoint for THIS EXACT file in bronze.source_manifest
+                try:
+                    min_ts = file_tbl["timestamp"][0].as_py() if rows_count > 0 else None
+                    max_ts = file_tbl["timestamp"][-1].as_py() if rows_count > 0 else None
+                    record_manifest_entry(
+                        catalog=catalog,
+                        source_file=p_file,
+                        exchange=exc,
+                        raw_symbol=sym,
+                        batch_id=batch_id,
+                        file_hash=f_hash,
+                        record_count=rows_count,
+                        min_timestamp=min_ts,
+                        max_timestamp=max_ts,
+                        status="INGESTED_BRONZE",
+                    )
+                except Exception as mf_err:
+                    print(f"Warning: Failed to record manifest for {file_name}: {mf_err}")
+
             elapsed = time.time() - t0
-
-            # Record checkpoint to bronze.source_manifest
-            try:
-                from src.utils.manifest_tracker import record_manifest_entry, compute_file_sha256
-                first_file = parquet_files[0] if parquet_files else f"{exc}_{sym}"
-                min_ts = arrow_tbl["timestamp"][0].as_py() if rows_count > 0 else None
-                max_ts = arrow_tbl["timestamp"][-1].as_py() if rows_count > 0 else None
-                f_hash = compute_file_sha256(first_file) if os.path.exists(first_file) else f"{exc}_{sym}_{rows_count}"
-                record_manifest_entry(
-                    catalog=catalog,
-                    source_file=first_file,
-                    exchange=exc,
-                    raw_symbol=sym,
-                    batch_id=batch_id,
-                    file_hash=f_hash,
-                    record_count=rows_count,
-                    min_timestamp=min_ts,
-                    max_timestamp=max_ts,
-                    status="INGESTED_BRONZE",
-                )
-            except Exception:
-                pass
-
-            print(f"[{exc} {idx}/{len(symbol_dirs)}] Ingested {rows_count:,} records for {sym} in {elapsed:.2f}s (running total: {total_ingested:,})")
+            skip_msg = f" (skipped {sym_skipped} existing files)" if sym_skipped > 0 else ""
+            print(f"[{exc} {idx}/{len(symbol_dirs)}] Ingested {sym_ingested:,} rows for {sym} in {elapsed:.2f}s{skip_msg} (running total: {total_ingested:,})")
 
     total_elapsed = time.time() - t_start
     print(f"\n[{datetime.now(timezone.utc).isoformat()}] Successfully ingested {total_ingested:,} total Bronze records in {total_elapsed:.1f}s ({total_ingested / max(total_elapsed, 1):,.0f} rows/s).")
