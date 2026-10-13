@@ -48,7 +48,7 @@ Khi tối ưu thành công một luồng xử lý hoặc pipeline, Agent **bắt
 - Airflow DAGs (`lakehouse_historical_backfill` và `lakehouse_incremental_hourly`) trực tiếp thực thi file:
   [`sql/ddl/02_create_gold_views.sql`](file:///e:/project_hybrid_lakehouse_crypto/sql/ddl/02_create_gold_views.sql)
 - **Quy tắc bắt buộc**:
-  - Khi bổ sung view phân tích mới (ví dụ: `v_fiat_stablecoin_rates`, `v_cross_exchange_normalized_spread`), phải ghi trực tiếp vào file [`sql/ddl/02_create_gold_views.sql`](file:///e:/project_hybrid_lakehouse_crypto/sql/ddl/02_create_gold_views.sql).
+  - Khi bổ sung view phân tích mới (ví dụ: `v_fiat_stablecoin_rates`, `v_daily_cross_exchange_normalized_spread`), phải ghi trực tiếp vào file [`sql/ddl/02_create_gold_views.sql`](file:///e:/project_hybrid_lakehouse_crypto/sql/ddl/02_create_gold_views.sql).
   - Tuyệt đối không tạo các file SQL đơn lẻ rời rạc bên ngoài thư mục chuẩn vì sẽ làm mất tính đồng bộ với Airflow orchestration.
 
 ---

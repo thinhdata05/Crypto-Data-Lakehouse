@@ -106,25 +106,33 @@ docker exec lakehouse-spark-iceberg spark-sql -e "SHOW VIEWS IN lakehouse.gold;"
 Views available:
 - `v_daily_crypto_ohlcv`: Daily OHLCV rollups per exchange.
 - `v_hourly_crypto_ohlcv`: Hourly OHLCV rollups per exchange.
-- `v_cross_exchange_comparison`: Raw close comparison and unadjusted spread.
-- `v_fiat_stablecoin_rates`: Live minute-level exchange rates for USDT and USDC to USD.
-- `v_cross_exchange_normalized_spread`: Real cross-exchange spread adjusted for stablecoin peg deviations.
+- `v_cross_exchange_daily_spread`: Pre-materialized daily cross-exchange spread.
+- `v_daily_cross_exchange_normalized_spread`: Materialized daily spread adjusted for stablecoin peg deviations (< 1s response).
+- `v_fiat_stablecoin_rates`: Reference rates for USDT and USDC to USD.
 
-### B. Sample Query: Normalized Arbitrage Spread (Partition-Pruned)
+### B. Sample Query: Normalized Arbitrage Serving
 ```sql
+-- 1. Fast analytical serving view (< 1s):
 SELECT 
     base_currency, 
-    timestamp, 
+    trade_date, 
     alpaca_close_usd, 
     binance_close_raw, 
-    binance_quote, 
-    stablecoin_rate_to_usd, 
+    usdt_rate_to_usd, 
     binance_close_usd_adjusted, 
     normalized_spread_abs, 
     normalized_spread_pct
-FROM lakehouse.gold.v_cross_exchange_normalized_spread 
-WHERE timestamp BETWEEN '2024-09-04 12:00:00' AND '2024-09-04 13:00:00' 
-  AND base_currency = 'BTC';
+FROM lakehouse.gold.v_daily_cross_exchange_normalized_spread 
+WHERE base_currency = 'BTC'
+ORDER BY trade_date DESC LIMIT 10;
+```
+
+For high-frequency minute-level spreads with pushdown partition safety:
+```bash
+docker exec lakehouse-spark-iceberg python src/serving/query_minute_spread.py \
+    --base-currency BTC \
+    --start-time 2026-08-10T00:00:00Z \
+    --end-time 2026-08-11T00:00:00Z
 ```
 
 ---

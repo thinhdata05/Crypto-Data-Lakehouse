@@ -78,8 +78,8 @@ $$\text{Binance}: \text{USDT} > \text{USDC} > \text{USD} > \text{BTC} \quad\mid\
 * `USD` (Fiat central bank currency) $\ne$ `USDT` (Tether stablecoin) $\ne$ `USDC` (Circle stablecoin).
 * Native table measures in Bronze/Silver/Gold must **never** apply in-flight currency conversions.
 
-### B. Normalized Spread View Contract
-When performing cross-exchange analytics or triggering arbitrage alerts, downstream consumers must query `lakehouse.gold.v_cross_exchange_normalized_spread`:
+### B. Normalized Spread Contract
+When performing cross-exchange analytics or triggering arbitrage alerts, downstream consumers must query the pre-materialized serving view `lakehouse.gold.v_daily_cross_exchange_normalized_spread` (or the bounded serving API `src/serving/query_minute_spread.py` for minute intervals):
 $$\text{Adjusted Binance Price (USD)} = \text{Close}_{\text{Binance}} \times \text{Rate}_{\text{USDT/USD}}$$
 $$\text{Normalized Spread} = \text{Close}_{\text{Alpaca (USD)}} - \text{Adjusted Binance Price (USD)}$$
 

@@ -109,8 +109,11 @@ docker exec lakehouse-spark-iceberg spark-sql -e "SELECT exchange, raw_symbol, t
 # 2. Xem tỷ giá Stablecoin tham chiếu (USDT-USD, USDC-USD)
 docker exec lakehouse-spark-iceberg spark-sql -e "SELECT * FROM lakehouse.gold.v_fiat_stablecoin_rates LIMIT 5;"
 
-# 3. Xem chênh lệch giá giữa Alpaca và Binance đã chuẩn hóa tỷ giá (Arbitrage Spread)
-docker exec lakehouse-spark-iceberg spark-sql -e "SELECT * FROM lakehouse.gold.v_cross_exchange_normalized_spread LIMIT 10;"
+# 3. Xem chênh lệch giá giữa Alpaca và Binance đã chuẩn hóa tỷ giá (Daily Normalized Arbitrage - Tức thì < 1s)
+docker exec lakehouse-spark-iceberg spark-sql -e "SELECT * FROM lakehouse.gold.v_daily_cross_exchange_normalized_spread LIMIT 10;"
+
+# 4. Xem chênh lệch giá chi tiết từng phút (Bảo vệ tài nguyên với Bounded Serving API, kiểm soát partition pushdown)
+docker exec lakehouse-spark-iceberg python src/serving/query_minute_spread.py --base-currency BTC --start-time 2026-08-10T00:00:00Z --end-time 2026-08-11T00:00:00Z
 ```
 
 ---
@@ -154,7 +157,7 @@ docker exec lakehouse-spark-iceberg spark-sql -e "SELECT * FROM lakehouse.gold.v
 4. **No Synthetic / Artificial Rows**:
    - Assets begin strictly at their real exchange listing date ($\ge 2021-01-01$ UTC). No synthetic forward-fill for unlisted periods.
 5. **Quote Currency Preservation**:
-   - Native quote currency (`USD`, `USDT`, `USDC`) is preserved in base physical tables. Normalization occurs exclusively at the analytical serving layer view (`v_cross_exchange_normalized_spread`).
+   - Native quote currency (`USD`, `USDT`, `USDC`) is preserved in base physical tables. Normalization occurs exclusively at the analytical serving layer view (`v_daily_cross_exchange_normalized_spread`) or via bounded serving query API (`src/serving/query_minute_spread.py`).
 
 ---
 
@@ -216,7 +219,8 @@ docker exec lakehouse-spark-iceberg spark-sql -e "SELECT * FROM lakehouse.gold.v
                    ▼                             ▼
        Gold Analytical Views             Pipeline Audit & DQ
        - v_daily_market_summary          (lakehouse.gold.pipeline_audit)
-       - v_cross_exchange_normalized_spread
+       - v_daily_cross_exchange_normalized_spread
+       - src/serving/query_minute_spread.py
        - v_fiat_stablecoin_rates
 ```
 

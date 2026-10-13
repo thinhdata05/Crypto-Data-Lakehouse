@@ -25,7 +25,7 @@ Tất cả các quy tắc vận hành cốt lõi được định nghĩa chi ti�
 2. [**`02-financial-domain-rules.md`**](file:///e:/project_hybrid_lakehouse_crypto/.agent/rules/02-financial-domain-rules.md):
    - **Quote Currency Preservation**: Tuyệt đối không quy đổi USDT sang USD trong các bảng vật lý cơ sở.
    - **Binance Hierarchy**: Lọc ưu tiên `USDT > USDC > USD > BTC`.
-   - **Normalized Spread Serving**: Quy đổi chuẩn hóa tỷ giá chỉ thực hiện ở View (`v_cross_exchange_normalized_spread`) qua bảng tỷ giá (`v_fiat_stablecoin_rates`).
+   - **Normalized Spread Serving**: Quy đổi chuẩn hóa tỷ giá chỉ thực hiện ở View (`v_daily_cross_exchange_normalized_spread`) hoặc bounded API (`query_minute_spread.py`) qua bảng tỷ giá (`v_fiat_stablecoin_rates`).
    - **OHLCV Sanity**: 100% tuân thủ bất đẳng thức OHLCV và volume $\ge 0$.
    - **No Synthetic Rows**: Bắt đầu dữ liệu từ ngày niêm yết thực tế ($\ge 2021-01-01$), không sinh dòng giả.
 

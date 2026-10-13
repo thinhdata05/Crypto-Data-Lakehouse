@@ -48,7 +48,7 @@ Quy tắc nghiệp vụ thị trường tài chính, xử lý đồng yết giá
 ## 4. Normalized Currency Conversion at Serving Layer (Chuẩn hóa tỷ giá tầng phục vụ)
 - Việc quy đổi tiền tệ để tính toán chênh lệch giá (Cross-Exchange Arbitrage Spread) **CHỈ ĐƯỢC PHÉP THỰC HIỆN Ở TẦNG SERVING (VIEW / ANALYTICS)**:
   - **View `lakehouse.gold.v_fiat_stablecoin_rates`**: Cung cấp chuỗi tỷ giá phút/ngày giữa `USDT-USD` và `USDC-USD`.
-  - **View `lakehouse.gold.v_cross_exchange_normalized_spread`**: Thực hiện chuẩn hóa giá Binance về USD trước khi so sánh với Alpaca:
+  - **View `lakehouse.gold.v_daily_cross_exchange_normalized_spread`** (hoặc bounded API `src/serving/query_minute_spread.py` cho cấp phút): Thực hiện chuẩn hóa giá Binance về USD trước khi so sánh với Alpaca:
     $$\text{normalized\_binance\_close} = \text{binance\_close} \times \text{coalesce(usdt\_usd\_rate, 1.0)}$$
     $$\text{normalized\_spread\_usd} = \text{alpaca\_close} - \text{normalized\_binance\_close}$$
     $$\text{normalized\_spread\_bps} = \left(\frac{\text{normalized\_spread\_usd}}{\text{alpaca\_close}}\right) \times 10,000$$
