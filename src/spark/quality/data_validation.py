@@ -41,19 +41,51 @@ def get_catalog():
     )
 
 
-def discover_symbols(staging_path: str | None = None) -> list[tuple[str, str]]:
-    resolved_path = staging_path or "/home/iceberg/warehouse_local/staging/canonical"
-    if not os.path.exists(resolved_path):
-        resolved_path = os.path.abspath(
+def discover_symbols_from_catalog(catalog) -> list[tuple[str, str]]:
+    """
+    Discovers distinct (exchange, raw_symbol) directly from catalog table truth.
+    Prioritizes conformed gold.dim_symbol, falls back to gold.curated_crypto_bars,
+    and finally to staging directory if catalog tables are empty.
+    """
+    # 1. Query conformed gold.dim_symbol
+    try:
+        dim_tbl = catalog.load_table("gold.dim_symbol")
+        if dim_tbl.current_snapshot():
+            arr = dim_tbl.scan(selected_fields=("exchange", "raw_symbol")).to_arrow()
+            if len(arr) > 0:
+                con = duckdb.connect()
+                rows = con.execute("SELECT DISTINCT exchange, raw_symbol FROM arr ORDER BY exchange, raw_symbol").fetchall()
+                print(f"[CATALOG TRUTH] Discovered {len(rows)} symbols from gold.dim_symbol.")
+                return [(r[0], r[1]) for r in rows]
+    except Exception as e:
+        print(f"[WARN] Could not query gold.dim_symbol: {e}")
+
+    # 2. Query gold.curated_crypto_bars
+    try:
+        gold_tbl = catalog.load_table("gold.curated_crypto_bars")
+        if gold_tbl.current_snapshot():
+            arr = gold_tbl.scan(selected_fields=("exchange", "raw_symbol")).to_arrow()
+            if len(arr) > 0:
+                con = duckdb.connect()
+                rows = con.execute("SELECT DISTINCT exchange, raw_symbol FROM arr ORDER BY exchange, raw_symbol").fetchall()
+                print(f"[CATALOG TRUTH] Discovered {len(rows)} symbols from gold.curated_crypto_bars.")
+                return [(r[0], r[1]) for r in rows]
+    except Exception as e:
+        print(f"[WARN] Could not query gold.curated_crypto_bars: {e}")
+
+    # 3. Fallback to local staging canonical
+    staging_path = "/home/iceberg/warehouse_local/staging/canonical"
+    if not os.path.exists(staging_path):
+        staging_path = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "../../../warehouse/staging/canonical")
         )
 
     symbols = []
-    if os.path.exists(resolved_path):
+    if os.path.exists(staging_path):
         import pyarrow.parquet as pq
 
-        for exc in sorted(os.listdir(resolved_path)):
-            exc_p = os.path.join(resolved_path, exc)
+        for exc in sorted(os.listdir(staging_path)):
+            exc_p = os.path.join(staging_path, exc)
             if os.path.isdir(exc_p):
                 for sym_folder in sorted(os.listdir(exc_p)):
                     sym_p = os.path.join(exc_p, sym_folder)
@@ -97,7 +129,7 @@ def run_validation(run_id: str | None = None) -> bool:
         print(f"[METRICS] Curated Silver Count: {curated_silver_count:,}")
         print(f"[METRICS] Curated Gold Count:   {gold_count:,}")
 
-        symbols = discover_symbols()
+        symbols = discover_symbols_from_catalog(catalog)
         total_duplicates = 0
         total_sanity_violations = 0
         exchanges_seen = set()
@@ -135,7 +167,13 @@ def run_validation(run_id: str | None = None) -> bool:
             violations = duck_con.execute("""
                 SELECT COUNT(*) FROM sym_arr
                 WHERE high < low 
+                   OR high < open
+                   OR high < close
+                   OR low > open
+                   OR low > close
                    OR open <= 0.0 
+                   OR high <= 0.0
+                   OR low <= 0.0
                    OR close <= 0.0 
                    OR volume < 0.0
                    OR exchange IS NULL 

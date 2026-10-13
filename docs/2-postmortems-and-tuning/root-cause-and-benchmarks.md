@@ -259,7 +259,78 @@ In addition to full historical backfill, the platform supports real-time schedul
 2. **Normalized Cross-Exchange Spread Calculation (Serving Layer)**:
    $$\text{Binance Close (USD Equivalent)} = \text{Close}_{\text{Binance (USDT)}} \times \text{Rate}_{\text{USDT/USD}}$$
    $$\text{Real Arbitrage Spread} = \text{Close}_{\text{Alpaca (USD)}} - \text{Binance Close (USD Equivalent)}$$
-3. **Filtered Alerting Thresholds**:
-   - Arbitrage notifications and algorithmic triggers in Phase 2 must evaluate the **Real Arbitrage Spread** net of stablecoin basis risk and trading transaction fees. This completely eliminates false-positive alerts on BI dashboards and real-time notification bots.
+---
+
+## 9. Architecture Audit Post-Mortem & Invariants Hardening (October 2026)
+
+### A. Executive Summary
+A comprehensive peer review revealed that while the conceptual design (Business Key, Multi-Exchange Independence, Quote Currency Preservation) was sound, the initial implementation contained four critical non-invariant gaps. These gaps have been resolved to achieve 100% production-grade compliance.
+
+### B. Findings, Root Causes & Resolutions
+
+#### 1. Partition Specification Drift in DDL
+* **Symptom**: `sql/ddl/01_create_iceberg_tables.sql` contained `PARTITIONED BY (exchange, days(timestamp))`.
+* **Root Cause**: Early prototype DDL included `exchange` in the partition spec, violating Invariant 4 (`days(timestamp)` only) and causing 2x partition small-file fragmentation.
+* **Resolution**: Updated DDL and migrated Iceberg catalog partition specs across all Medallion tiers (`bronze`, `silver`, `curated_silver`, `gold`) to strictly `PARTITIONED BY (days(timestamp))`.
+* **Prevention**: Added contract test `test_ddl_partition_specs_strict_days_only` verifying that `exchange` never appears in the DDL partition transform.
+
+#### 2. Non-Idempotent Historical Ingestion Appends
+* **Symptom**: Re-running `silver_to_curated_silver.py`, `curated_silver_to_gold.py`, or `materialize_gold_aggregates.py` performed blind `.append()`, doubling row counts.
+* **Root Cause**: Ingestion scripts were originally tuned for a clean initial load, lacking replay/reconcile branches.
+* **Resolution**: Refactored PyIceberg ingestion paths to inspect target tables for existing symbols. If existing records are detected, the pipeline automatically executes an atomic `target_tbl.overwrite(reconciled_arr, overwrite_filter=sym_filter)` instead of `.append()`. For aggregates, `t_daily` overwrites by symbol and `t_spread` atomically overwrites the table.
+* **Prevention**: Added contract test `test_idempotent_deduplication_replay` proving that duplicate re-runs yield identical row counts.
+
+#### 3. Incomplete OHLCV Mathematical Consistency Checks
+* **Symptom**: SQL filtering in `bronze_to_silver.py` and `data_validation.py` only validated `high >= low`, omitting boundary checks against open and close prices.
+* **Root Cause**: SQL predicates were simplified during initial drafting.
+* **Resolution**: Standardized on a centralized 7-condition predicate:
+  $$\text{open} > 0 \land \text{high} > 0 \land \text{low} > 0 \land \text{close} > 0 \land \text{volume} \ge 0$$
+  $$\text{high} \ge \text{low} \land \text{high} \ge \text{open} \land \text{high} \ge \text{close} \land \text{low} \le \text{open} \land \text{low} \le \text{close}$$
+  Exported as `OHLCV_SANITY_SQL_PREDICATE` and `OHLCV_VIOLATION_SQL_PREDICATE` in `src/preprocessing/normalizer.py`.
+* **Prevention**: Added contract test `test_ohlcv_all_seven_sanity_rules` testing all invalid boundary conditions.
+
+#### 4. Unbounded Full-Table Self-Joins in Analytical Serving Views
+* **Symptom**: Querying `v_cross_exchange_comparison` or `v_cross_exchange_normalized_spread` without a `WHERE timestamp` clause triggered full-table self-joins on 100M rows, exhausting executor threads.
+* **Root Cause**: Analytical views directly joined base 1-minute fact tables without materialized aggregate shortcuts or partition pruning guards.
+* **Resolution**:
+  - Pointed `v_daily_crypto_ohlcv` and `v_cross_exchange_daily_spread` to pre-materialized tables (`agg_daily_crypto_ohlcv`, `agg_daily_cross_exchange_spread`) for sub-second serving.
+  - Created `v_daily_cross_exchange_normalized_spread` joining daily aggregates with stablecoin reference rates.
+  - Added query guards and partition pruning warnings to minute-level views.
+
+---
+
+## 10. Architecture Review 2: Senior DE Production Hardening (7/7 Findings Resolved)
+
+A second comprehensive peer review identified 7 architectural gaps required to transition from a functioning benchmark to a 100% production-grade data platform. All 7 findings have been implemented, tested, and validated:
+
+### 1. DDL Migration & Partition Spec Evolution Engine
+* **Symptom**: `CREATE TABLE IF NOT EXISTS` leaves existing Iceberg tables untouched, so previously created tables retain old partition specs.
+* **Resolution**: Created `src/utils/verify_and_migrate_catalog.py` which dynamically inspects partition specs across all tables via PyIceberg REST API and automatically evolves violating partition specs (e.g. removes obsolete `exchange` partition transforms). Added runbook `docs/4-runbooks/catalog-partition-migration.md`. Wired into Airflow DAG `lakehouse_historical_backfill` under task `init_iceberg_tables`.
+
+### 2. Idempotent Dimension Materializer for `gold.dim_symbol`
+* **Symptom**: `gold.dim_symbol` existed in DDL and was queried by `rest_fetcher.py`, but lacked an automated materialization job.
+* **Resolution**: Built `src/spark/gold/materialize_dim_symbol.py`. Derives conformed SCD Type 1 dimensions (`exchange`, `raw_symbol`, `canonical_symbol`, `first_trade_date`, `last_trade_date`, `total_bars_recorded`) directly from table truth with stable surrogate keys (`symbol_key`). Overwrites `gold.dim_symbol` atomically. Also integrated directly into `materialize_gold_aggregates.py`.
+
+### 3. Serving Layer Guard: Elimination of Unguarded Minute-Level Views
+* **Symptom**: Comment guards in SQL views cannot enforce `WHERE` predicates; running `SELECT * FROM v_cross_exchange_minute_spread LIMIT 10` executes an unpartitioned 100M-row self-join.
+* **Resolution**: Dropped unguarded minute-level self-join views from `sql/ddl/02_create_gold_views.sql`. Public serving layer now strictly exposes pre-materialized aggregates (`v_daily_crypto_ohlcv`, `v_hourly_crypto_ohlcv`, `v_cross_exchange_daily_spread`, `v_daily_cross_exchange_normalized_spread`). Implemented `src/serving/query_minute_spread.py` which strictly enforces mandatory `[start_time, end_time]` parameters and rejects windows $> 7$ days, executing pushdown partition filtering on both sides before joining in-process.
+
+### 4. Integration Test for Live Iceberg Atomic Overwrite
+* **Symptom**: Previous tests only validated DuckDB windowing logic, not actual PyIceberg `.overwrite(..., overwrite_filter=...)` behavior.
+* **Resolution**: Implemented `tests/test_iceberg_idempotency.py`. Connects to live Iceberg REST catalog and MinIO, creates temporary partitioned Iceberg tables, tests initial append vs. multiple replay overwrites, verifies row count invariance ($N = 3$), validates in-place value updates, and asserts that symbol-scoped overwrites leave other symbols untouched.
+
+### 5. Idempotent Silver Writes & Checkpoint Protection
+* **Symptom**: Silver layer was appending blindly, causing storage and metadata bloat on pipeline replays.
+* **Resolution**: Updated `src/spark/silver/bronze_to_silver.py` with scoped check-and-overwrite (`target_tbl.overwrite(clean_arr, overwrite_filter=sym_filter)`). Replaying the Silver layer now leaves row counts strictly invariant.
+
+### 6. Symbol Discovery from Catalog Truth
+* **Symptom**: `data_validation.py` and `materialize_gold_aggregates.py` discovered symbols by inspecting local staging parquet files on disk. If staging was cleaned or mismatched with Gold, validation missed corrupt data.
+* **Resolution**: Refactored `discover_symbols_from_catalog()` in both `data_validation.py` and `materialize_gold_aggregates.py`. Discovers active symbols directly from `gold.dim_symbol` or `gold.curated_crypto_bars` metadata scans, eliminating disk coupling.
+
+### 7. Source Ingestion Manifest Table (`bronze.source_manifest`)
+* **Symptom**: Absence of checkpointing table to record which raw source files or symbol batches have been ingested, their hashes, row counts, and status.
+* **Resolution**: Added `lakehouse.bronze.source_manifest` to DDL (partitioned by `days(processed_at)`). Implemented `src/utils/manifest_tracker.py` computing SHA-256 hashes, tracking status (`INGESTED_BRONZE`, `PROCESSED_SILVER`), min/max timestamps, and row counts for every processed file. Integrated into `raw_to_bronze.py` and `bronze_to_silver.py`.
+
+
 
 

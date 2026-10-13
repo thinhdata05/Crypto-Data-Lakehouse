@@ -157,13 +157,25 @@ def main() -> None:
         # Cast to target table schema
         gold_arr = gold_arr.cast(target_schema)
 
-        # PyIceberg streaming append to Curated Gold
-        target_tbl.append(gold_arr)
+        # Idempotent write: overwrite if symbol already present, append if initial load
+        sym_filter = And(EqualTo("exchange", exc), EqualTo("raw_symbol", sym))
+        try:
+            existing_count = len(target_tbl.scan(row_filter=sym_filter).to_arrow())
+        except Exception:
+            existing_count = 0
+
+        if existing_count > 0:
+            target_tbl.overwrite(gold_arr, overwrite_filter=sym_filter)
+            action_desc = "Overwrote (Idempotent Replay)"
+        else:
+            target_tbl.append(gold_arr)
+            action_desc = "Appended (Initial Load)"
+
         total_synced += rows_count
         elapsed = time.time() - t0
 
         print(
-            f"[{exc} {idx}/{total_symbols}] Synced {rows_count:,} rows for {sym} "
+            f"[{exc} {idx}/{total_symbols}] {action_desc} {rows_count:,} rows for {sym} "
             f"into Curated Gold in {elapsed:.1f}s (running total: {total_synced:,})"
         )
 

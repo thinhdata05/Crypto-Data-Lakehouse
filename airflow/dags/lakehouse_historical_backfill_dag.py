@@ -82,12 +82,14 @@ with DAG(
         """,
     )
 
-    # 3. Ensure Iceberg Tables exist
+    # 3. Ensure Iceberg Tables exist and strictly conform to partition invariants
     init_iceberg_tables = BashOperator(
         task_id="init_iceberg_tables",
         bash_command="""
         set -e
+        echo "TASK: Initialize DDL and Verify Partition Invariants"
         docker exec lakehouse-spark-iceberg spark-sql -f /home/iceberg/sql/ddl/01_create_iceberg_tables.sql
+        docker exec lakehouse-spark-iceberg python3 /home/iceberg/src/utils/verify_and_migrate_catalog.py
         """,
     )
 

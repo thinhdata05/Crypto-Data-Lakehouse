@@ -158,8 +158,13 @@ def main() -> None:
                 batch_id,
                 ingested_at
             FROM arr
-            WHERE open > 0 AND high > 0 AND low > 0 AND close > 0 
-              AND high >= low AND volume >= 0
+            WHERE open > 0.0 AND high > 0.0 AND low > 0.0 AND close > 0.0 
+              AND volume >= 0.0
+              AND high >= low
+              AND high >= open
+              AND high >= close
+              AND low <= open
+              AND low <= close
               AND open IS NOT NULL AND high IS NOT NULL AND low IS NOT NULL 
               AND close IS NOT NULL AND volume IS NOT NULL
             QUALIFY ROW_NUMBER() OVER (
@@ -175,16 +180,52 @@ def main() -> None:
         # Cast to target table schema
         clean_arr = clean_arr.cast(target_schema)
 
-        # PyIceberg streaming append to Silver
-        target_tbl.append(clean_arr)
+        # Idempotent Write: check if (exchange, raw_symbol) already exists in Silver
+        sym_filter = And(EqualTo("exchange", exc), EqualTo("raw_symbol", sym))
+        try:
+            existing_scan = target_tbl.scan(
+                row_filter=sym_filter,
+                selected_fields=("raw_symbol",),
+            )
+            has_existing = len(existing_scan.to_arrow()) > 0
+        except Exception:
+            has_existing = False
+
+        if has_existing:
+            target_tbl.overwrite(clean_arr, overwrite_filter=sym_filter)
+            action_desc = "Overwrote (Idempotent Replay)"
+        else:
+            target_tbl.append(clean_arr)
+            action_desc = "Appended (Initial Load)"
+
         total_cleansed += clean_count
         elapsed = time.time() - t0
 
         drop_msg = f" (filtered {dropped_count:,} invalid/dup)" if dropped_count > 0 else ""
         print(
-            f"[{exc} {idx}/{total_symbols}] Cleansed & appended {clean_count:,} rows for {sym} "
+            f"[{exc} {idx}/{total_symbols}] {action_desc} {clean_count:,} rows for {sym} "
             f"in {elapsed:.1f}s{drop_msg} (running total: {total_cleansed:,})"
         )
+
+        # Checkpoint to bronze.source_manifest
+        try:
+            from src.utils.manifest_tracker import record_manifest_entry
+            min_ts = clean_arr["timestamp"][0].as_py() if clean_count > 0 else None
+            max_ts = clean_arr["timestamp"][-1].as_py() if clean_count > 0 else None
+            record_manifest_entry(
+                catalog=catalog,
+                source_file=f"silver/{exc}/{sym}",
+                exchange=exc,
+                raw_symbol=sym,
+                batch_id=batch_id,
+                file_hash=f"{exc}_{sym}_{clean_count}",
+                record_count=clean_count,
+                min_timestamp=min_ts,
+                max_timestamp=max_ts,
+                status="PROCESSED_SILVER",
+            )
+        except Exception as mf_err:
+            pass
 
     total_elapsed = time.time() - t_start
     print(

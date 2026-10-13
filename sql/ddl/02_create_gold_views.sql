@@ -4,24 +4,23 @@
 -- In accordance with PROJECT_LAKEHOUSE_MIGRATION_SPEC_FINAL.md
 -- ==============================================================================
 
--- 1. Daily Aggregated OHLCV Rollup per Exchange and Canonical Symbol
+-- 1. Daily Aggregated OHLCV Serving View (Backed by Materialized Fact Table)
 CREATE OR REPLACE VIEW lakehouse.gold.v_daily_crypto_ohlcv AS
 SELECT
     exchange,
     canonical_symbol,
     base_currency,
     quote_currency,
-    to_date(timestamp) AS trade_date,
-    min_by(open, timestamp) AS open_price,
-    max(high) AS high_price,
-    min(low) AS low_price,
-    max_by(close, timestamp) AS close_price,
-    sum(volume) AS total_volume,
-    sum(trade_count) AS total_trades,
-    count(*) AS minute_bars_count,
-    max(last_updated_at) AS last_updated_at
-FROM lakehouse.gold.curated_crypto_bars
-GROUP BY exchange, canonical_symbol, base_currency, quote_currency, to_date(timestamp);
+    trade_date,
+    open_price,
+    high_price,
+    low_price,
+    close_price,
+    total_volume,
+    total_trades,
+    minute_bars_count,
+    last_updated_at
+FROM lakehouse.gold.agg_daily_crypto_ohlcv;
 
 -- 2. Hourly Aggregated OHLCV Rollup per Exchange
 CREATE OR REPLACE VIEW lakehouse.gold.v_hourly_crypto_ohlcv AS
@@ -41,22 +40,31 @@ SELECT
 FROM lakehouse.gold.curated_crypto_bars
 GROUP BY exchange, canonical_symbol, base_currency, quote_currency, date_trunc('hour', timestamp);
 
--- 3. Cross-Exchange Comparison View (Alpaca vs Binance for concurrent minutes)
-CREATE OR REPLACE VIEW lakehouse.gold.v_cross_exchange_comparison AS
+-- 3. Daily Cross-Exchange Comparison View (Backed by Materialized Table - Instant Response)
+CREATE OR REPLACE VIEW lakehouse.gold.v_cross_exchange_daily_spread AS
 SELECT
-    a.base_currency,
-    a.timestamp,
-    a.close AS alpaca_close,
-    a.volume AS alpaca_volume,
-    b.close AS binance_close,
-    b.volume AS binance_volume,
-    (a.close - b.close) AS spread_abs,
-    round(((a.close - b.close) / b.close) * 100, 4) AS spread_pct
-FROM lakehouse.gold.curated_crypto_bars a
-JOIN lakehouse.gold.curated_crypto_bars b
-  ON a.base_currency = b.base_currency
-  AND a.timestamp = b.timestamp
-WHERE a.exchange = 'alpaca' AND b.exchange = 'binance';
+    base_currency,
+    trade_date,
+    alpaca_close,
+    alpaca_volume,
+    binance_close,
+    binance_volume,
+    spread_abs,
+    spread_pct,
+    last_updated_at
+FROM lakehouse.gold.agg_daily_cross_exchange_spread;
+
+-- Backwards compatibility alias for daily cross exchange
+CREATE OR REPLACE VIEW lakehouse.gold.v_cross_exchange_comparison AS
+SELECT * FROM lakehouse.gold.v_cross_exchange_daily_spread;
+
+-- NOTE ON MINUTE-LEVEL ARBITRAGE / CROSS-EXCHANGE VIEWS:
+-- Unguarded minute-level views (e.g. self-joining 100M+ rows on curated_crypto_bars)
+-- are deliberately EXCLUDED from public DDL views to prevent accidental Cartesian scans
+-- and JVM Heap exhaustion (violating Lakehouse Invariant 01 & Rule 03).
+-- To query minute-level cross-exchange spreads safely, use the bounded serving API:
+-- python src/serving/query_minute_spread.py --base-currency BTC --start-time <ISO> --end-time <ISO>
+-- which strictly enforces partition pruning and max window constraints.
 
 -- 4. Pipeline Audit Summary
 CREATE OR REPLACE VIEW lakehouse.gold.v_pipeline_audit_summary AS
@@ -86,30 +94,26 @@ SELECT
 FROM lakehouse.gold.curated_crypto_bars
 WHERE canonical_symbol IN ('USDT-USD', 'USDC-USD');
 
--- 6. Normalized Cross-Exchange Spread (Eliminating Stablecoin De-peg Phantom Arbitrage)
-CREATE OR REPLACE VIEW lakehouse.gold.v_cross_exchange_normalized_spread AS
+-- 7. Daily Normalized Cross-Exchange Spread (Fast Analytical Serving from Materialized Aggregates)
+CREATE OR REPLACE VIEW lakehouse.gold.v_daily_cross_exchange_normalized_spread AS
 SELECT
-    a.base_currency,
-    a.timestamp,
-    a.close AS alpaca_close_usd,
-    a.volume AS alpaca_volume,
-    b.close AS binance_close_raw,
-    b.volume AS binance_volume,
-    b.quote_currency AS binance_quote,
-    coalesce(r.rate_to_usd, 1.0) AS stablecoin_rate_to_usd,
-    round(b.close * coalesce(r.rate_to_usd, 1.0), 4) AS binance_close_usd_adjusted,
-    round(a.close - (b.close * coalesce(r.rate_to_usd, 1.0)), 4) AS normalized_spread_abs,
-    round(((a.close - (b.close * coalesce(r.rate_to_usd, 1.0))) / (b.close * coalesce(r.rate_to_usd, 1.0))) * 100, 4) AS normalized_spread_pct
-FROM lakehouse.gold.curated_crypto_bars a
-JOIN lakehouse.gold.curated_crypto_bars b
-  ON a.base_currency = b.base_currency
-  AND a.timestamp = b.timestamp
+    s.base_currency,
+    s.trade_date,
+    s.alpaca_close AS alpaca_close_usd,
+    s.alpaca_volume,
+    s.binance_close AS binance_close_raw,
+    s.binance_volume,
+    coalesce(r.rate_to_usd, 1.0) AS usdt_rate_to_usd,
+    round(s.binance_close * coalesce(r.rate_to_usd, 1.0), 4) AS binance_close_usd_adjusted,
+    round(s.alpaca_close - (s.binance_close * coalesce(r.rate_to_usd, 1.0)), 4) AS normalized_spread_abs,
+    round(((s.alpaca_close - (s.binance_close * coalesce(r.rate_to_usd, 1.0))) / (s.binance_close * coalesce(r.rate_to_usd, 1.0))) * 100, 4) AS normalized_spread_pct,
+    s.last_updated_at
+FROM lakehouse.gold.agg_daily_cross_exchange_spread s
 LEFT JOIN (
-    SELECT timestamp, base_currency, close AS rate_to_usd
-    FROM lakehouse.gold.curated_crypto_bars
-    WHERE canonical_symbol IN ('USDT-USD', 'USDC-USD')
+    SELECT trade_date, close_price AS rate_to_usd
+    FROM lakehouse.gold.agg_daily_crypto_ohlcv
+    WHERE canonical_symbol = 'USDT-USD'
 ) r
-  ON r.timestamp = b.timestamp
-  AND r.base_currency = b.quote_currency
-WHERE a.exchange = 'alpaca' AND b.exchange = 'binance';
+  ON r.trade_date = s.trade_date;
+
 

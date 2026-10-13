@@ -39,19 +39,48 @@ def get_catalog():
     )
 
 
-def discover_symbols(staging_path: str | None = None) -> list[tuple[str, str]]:
-    resolved_path = staging_path or "/home/iceberg/warehouse_local/staging/canonical"
-    if not os.path.exists(resolved_path):
-        resolved_path = os.path.abspath(
+def discover_symbols_from_catalog(catalog) -> list[tuple[str, str]]:
+    """
+    Discovers distinct (exchange, raw_symbol) directly from catalog table truth.
+    Prioritizes conformed gold.dim_symbol, falls back to gold.curated_crypto_bars.
+    """
+    try:
+        dim_tbl = catalog.load_table("gold.dim_symbol")
+        if dim_tbl.current_snapshot():
+            arr = dim_tbl.scan(selected_fields=("exchange", "raw_symbol")).to_arrow()
+            if len(arr) > 0:
+                con = duckdb.connect()
+                rows = con.execute("SELECT DISTINCT exchange, raw_symbol FROM arr ORDER BY exchange, raw_symbol").fetchall()
+                print(f"[CATALOG TRUTH] Discovered {len(rows)} symbols from gold.dim_symbol.")
+                return [(r[0], r[1]) for r in rows]
+    except Exception as e:
+        print(f"[WARN] Could not query gold.dim_symbol: {e}")
+
+    try:
+        gold_tbl = catalog.load_table("gold.curated_crypto_bars")
+        if gold_tbl.current_snapshot():
+            arr = gold_tbl.scan(selected_fields=("exchange", "raw_symbol")).to_arrow()
+            if len(arr) > 0:
+                con = duckdb.connect()
+                rows = con.execute("SELECT DISTINCT exchange, raw_symbol FROM arr ORDER BY exchange, raw_symbol").fetchall()
+                print(f"[CATALOG TRUTH] Discovered {len(rows)} symbols from gold.curated_crypto_bars.")
+                return [(r[0], r[1]) for r in rows]
+    except Exception as e:
+        print(f"[WARN] Could not query gold.curated_crypto_bars: {e}")
+
+    # Fallback to local staging canonical
+    staging_path = "/home/iceberg/warehouse_local/staging/canonical"
+    if not os.path.exists(staging_path):
+        staging_path = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "../../../warehouse/staging/canonical")
         )
 
     symbols = []
-    if os.path.exists(resolved_path):
+    if os.path.exists(staging_path):
         import pyarrow.parquet as pq
 
-        for exc in sorted(os.listdir(resolved_path)):
-            exc_p = os.path.join(resolved_path, exc)
+        for exc in sorted(os.listdir(staging_path)):
+            exc_p = os.path.join(staging_path, exc)
             if os.path.isdir(exc_p):
                 for sym_folder in sorted(os.listdir(exc_p)):
                     sym_p = os.path.join(exc_p, sym_folder)
@@ -73,7 +102,7 @@ def main() -> None:
     t_daily = catalog.load_table("gold.agg_daily_crypto_ohlcv")
     target_schema_daily = t_daily.schema().as_arrow()
 
-    symbols = discover_symbols()
+    symbols = discover_symbols_from_catalog(catalog)
     total_symbols = len(symbols)
     duck_con = duckdb.connect()
 
@@ -109,10 +138,23 @@ def main() -> None:
         """).arrow()
 
         agg_arr = agg_arr.cast(target_schema_daily)
-        t_daily.append(agg_arr)
+        can_sym = arr["canonical_symbol"][0].as_py()
+        sym_filter = And(EqualTo("exchange", exc), EqualTo("canonical_symbol", can_sym))
+        try:
+            existing_count = len(t_daily.scan(row_filter=sym_filter).to_arrow())
+        except Exception:
+            existing_count = 0
+
+        if existing_count > 0:
+            t_daily.overwrite(agg_arr, overwrite_filter=sym_filter)
+            action_desc = "Overwrote (Idempotent Replay)"
+        else:
+            t_daily.append(agg_arr)
+            action_desc = "Appended (Initial Load)"
+
         total_daily_rows += len(agg_arr)
         elapsed = time.time() - t0
-        print(f"[{exc} {idx}/{total_symbols}] Aggregated {len(arr):,} minute bars -> {len(agg_arr):,} daily rows for {sym} in {elapsed:.1f}s")
+        print(f"[{exc} {idx}/{total_symbols}] {action_desc} {len(arr):,} minute bars -> {len(agg_arr):,} daily rows for {sym} in {elapsed:.1f}s")
 
     print(f"\nMaterialized {total_daily_rows:,} daily OHLCV records in {time.time()-t_start:.1f}s.")
 
@@ -142,9 +184,20 @@ def main() -> None:
     """).arrow()
 
     spread_arr = spread_arr.cast(target_schema_spread)
-    t_spread.append(spread_arr)
-    print(f"Materialized {len(spread_arr):,} daily cross-exchange spread records successfully!")
+    # Idempotent write: overwrite the aggregated cross-exchange table
+    t_spread.overwrite(spread_arr)
+    print(f"Materialized & overwrote {len(spread_arr):,} daily cross-exchange spread records successfully!")
+
+    # 3. Materialize & Refresh Conformed Dimension gold.dim_symbol
+    try:
+        from src.spark.gold.materialize_dim_symbol import materialize_dim_symbol
+        print("\nRefreshing lakehouse.gold.dim_symbol...")
+        dim_count = materialize_dim_symbol(catalog=catalog)
+        print(f"Refreshed conformed gold.dim_symbol ({dim_count} symbols).")
+    except Exception as dim_err:
+        print(f"[WARN] Failed to refresh dim_symbol: {dim_err}")
 
 
 if __name__ == "__main__":
     main()
+

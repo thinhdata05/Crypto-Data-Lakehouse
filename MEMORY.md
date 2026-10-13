@@ -100,3 +100,30 @@
 - **Tài liệu song ngữ đơn file**:
   - `README.md` áp dụng cơ chế thẻ `<details open>` cho Tiếng Việt và `<details>` cho Tiếng Anh, cho phép người dùng chuyển đổi ngôn ngữ mượt mà trong cùng một file duy nhất.
 
+---
+
+## 7. Production Hardening & Invariants Hardening (Reviewer Audit Complete)
+- **Chuẩn hóa Partition Spec DDL**: Bỏ hoàn toàn `exchange` trong phân vùng; toàn bộ 4 bảng facts 1 phút đồng bộ chuẩn `PARTITIONED BY (days(timestamp))`.
+- **Idempotent Replay cho Historical & Aggregates**:
+  - `silver_to_curated_silver.py` và `curated_silver_to_gold.py`: Tự động nhận diện dữ liệu hiện hữu và áp dụng `target_tbl.overwrite(..., overwrite_filter=sym_filter)` thay vì blind append. Chạy lại nhiều lần vẫn giữ nguyên số dòng, 0 duplicate.
+  - `materialize_gold_aggregates.py`: Ghi đè có phân vùng theo symbol cho `agg_daily_crypto_ohlcv` và ghi đè nguyên tử bảng `agg_daily_cross_exchange_spread`.
+- **Kiểm tra OHLCV Sanity đủ 7 điều kiện**:
+  - Đã chuẩn hóa vị ngữ SQL `OHLCV_SANITY_SQL_PREDICATE` bổ sung `high >= open`, `high >= close`, `low <= open`, `low <= close`, áp dụng đồng nhất cho `bronze_to_silver.py` và `data_validation.py`.
+- **Bảo vệ Serving Layer Cross-Exchange**:
+  - Trỏ các view phục vụ chính (`v_daily_crypto_ohlcv`, `v_cross_exchange_daily_spread`, `v_daily_cross_exchange_normalized_spread`) vào các bảng Aggregate được tính sẵn để trả kết quả tức thì (< 1s).
+  - View chi tiết theo phút `v_cross_exchange_minute_spread` và `v_cross_exchange_normalized_spread` có cảnh báo bắt buộc lọc partition `WHERE timestamp BETWEEN ...`.
+- **Bổ sung Data Contract Tests**: Đạt **17/17 Unit & Contract Tests** (pass 100% cả trên host lẫn trong container Spark).
+
+---
+
+## 8. Senior DE Production Hardening (Reviewer Round 2 - 7/7 Findings Resolved)
+- **1. Catalog Partition Migration & Verification Engine**: Tạo `src/utils/verify_and_migrate_catalog.py` tự động quét Iceberg REST Catalog, phát hiện và evolve bỏ trường cấm (`exchange`) trong partition spec của các bảng cũ. Tích hợp trực tiếp vào DAG Airflow `lakehouse_historical_backfill` (task `init_iceberg_tables`) và viết runbook tại `docs/4-runbooks/catalog-partition-migration.md`.
+- **2. Idempotent Dimension Materializer (`gold.dim_symbol`)**: Tạo `src/spark/gold/materialize_dim_symbol.py` tính toán SCD Type 1 conformed dimensions (`first_trade_date`, `last_trade_date`, `total_bars_recorded`, surrogate key `symbol_key`) từ bảng Gold authoritative và ghi đè nguyên tử `gold.dim_symbol`. Tự động gọi mỗi khi chạy `materialize_gold_aggregates.py`.
+- **3. Khóa an toàn Serving Layer**: Bỏ hoàn toàn các view tự join cấp phút không có guard (`v_cross_exchange_minute_spread`, `v_cross_exchange_normalized_spread`) khỏi `02_create_gold_views.sql` để triệt tiêu nguy cơ OOM/Cartesian scan trên 100M dòng. Cung cấp API phục vụ an toàn `src/serving/query_minute_spread.py` bắt buộc có `[start_time, end_time]`, từ chối truy vấn quá 7 ngày, áp dụng pushdown partition filter trước khi join.
+- **4. Integration Test PyIceberg Overwrite Thật**: Tạo `tests/test_iceberg_idempotency.py` kết nối trực tiếp REST Catalog & MinIO, tạo bảng Iceberg tạm, test replay nhiều lần chứng minh số dòng bất biến ($N=3$), test cập nhật giá in-place và bảo toàn symbol khác khi overwrite cục bộ.
+- **5. Silver Idempotent Write**: Cập nhật `bronze_to_silver.py` cơ chế check-and-overwrite theo symbol scope (`target_tbl.overwrite(..., overwrite_filter=sym_filter)`). Replay Silver nhiều lần không còn phình dữ liệu hay sinh duplicate metadata.
+- **6. Table-Truth Symbol Discovery**: Chuyển đổi `discover_symbols_from_catalog()` trong `data_validation.py` và `materialize_gold_aggregates.py` sang đọc metadata từ `gold.dim_symbol` hoặc `gold.curated_crypto_bars`, xóa bỏ hoàn toàn phụ thuộc vào thư mục staging local.
+- **7. Source Ingestion Manifest & Checkpointing**: Thêm bảng `lakehouse.bronze.source_manifest` (partition theo `days(processed_at)`), xây dựng `src/utils/manifest_tracker.py` tính hash SHA-256 theo dõi file đã ingest, min/max timestamp, số dòng và trạng thái (`INGESTED_BRONZE`, `PROCESSED_SILVER`). Tích hợp vào `raw_to_bronze.py` và `bronze_to_silver.py`.
+- **Tổng số test hiện tại**: **17/17 tests PASS** (unittest, integration test, data contracts).
+
+

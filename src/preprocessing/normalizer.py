@@ -211,6 +211,33 @@ def validate_ohlcv_record(
     return True, None
 
 
+OHLCV_SANITY_SQL_PREDICATE = """
+    open > 0.0 AND high > 0.0 AND low > 0.0 AND close > 0.0
+    AND volume >= 0.0
+    AND high >= low
+    AND high >= open
+    AND high >= close
+    AND low <= open
+    AND low <= close
+    AND open IS NOT NULL AND high IS NOT NULL AND low IS NOT NULL 
+    AND close IS NOT NULL AND volume IS NOT NULL
+""".strip()
+
+OHLCV_VIOLATION_SQL_PREDICATE = """
+    high < low
+    OR high < open
+    OR high < close
+    OR low > open
+    OR low > close
+    OR open <= 0.0
+    OR high <= 0.0
+    OR low <= 0.0
+    OR close <= 0.0
+    OR volume < 0.0
+    OR open IS NULL OR high IS NULL OR low IS NULL OR close IS NULL OR volume IS NULL
+""".strip()
+
+
 BINANCE_PREFERRED_QUOTE_ORDER = ["USDT", "USDC", "USD", "BTC", "ETH", "BNB"]
 ALPACA_PREFERRED_QUOTE_ORDER = ["USD", "USDT", "USDC"]
 

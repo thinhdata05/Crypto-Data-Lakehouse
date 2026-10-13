@@ -84,6 +84,26 @@ class TestNormalizer(unittest.TestCase):
         valid, err = validate_ohlcv_record(100.0, 105.0, 95.0, 102.0, -1.0)
         self.assertFalse(valid)
 
+        # Invalid: Open exceeds High
+        valid, err = validate_ohlcv_record(110.0, 105.0, 95.0, 102.0, 10.5)
+        self.assertFalse(valid)
+        self.assertIn("exceeds High", err)
+
+        # Invalid: Close exceeds High
+        valid, err = validate_ohlcv_record(100.0, 105.0, 95.0, 108.0, 10.5)
+        self.assertFalse(valid)
+        self.assertIn("exceeds High", err)
+
+        # Invalid: Open below Low
+        valid, err = validate_ohlcv_record(90.0, 105.0, 95.0, 102.0, 10.5)
+        self.assertFalse(valid)
+        self.assertIn("below Low", err)
+
+        # Invalid: Close below Low
+        valid, err = validate_ohlcv_record(100.0, 105.0, 95.0, 90.0, 10.5)
+        self.assertFalse(valid)
+        self.assertIn("below Low", err)
+
     def test_resolve_preferred_quote_symbols_binance(self):
         """
         Verify SPEC_FINAL Section 4 Scope Rule:

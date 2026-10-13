@@ -10,7 +10,7 @@ CREATE DATABASE IF NOT EXISTS lakehouse.bronze;
 CREATE DATABASE IF NOT EXISTS lakehouse.silver;
 CREATE DATABASE IF NOT EXISTS lakehouse.gold;
 
--- 1. Bronze Table: Raw canonical ingestion partitioned by (exchange, days(timestamp))
+-- 1. Bronze Table: Raw canonical ingestion partitioned by days(timestamp)
 CREATE TABLE IF NOT EXISTS lakehouse.bronze.crypto_bars (
     exchange STRING,
     raw_symbol STRING,
@@ -29,10 +29,10 @@ CREATE TABLE IF NOT EXISTS lakehouse.bronze.crypto_bars (
     ingested_at TIMESTAMP
 )
 USING iceberg
-PARTITIONED BY (exchange, days(timestamp))
+PARTITIONED BY (days(timestamp))
 TBLPROPERTIES ('write.distribution-mode'='range', 'write.fanout.enabled'='false');
 
--- 2. Silver Table (Per-Exchange Cleansed): Partitioned by (exchange, days(timestamp))
+-- 2. Silver Table (Per-Exchange Cleansed): Partitioned by days(timestamp)
 CREATE TABLE IF NOT EXISTS lakehouse.silver.crypto_bars (
     exchange STRING,
     raw_symbol STRING,
@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS lakehouse.silver.crypto_bars (
     ingested_at TIMESTAMP
 )
 USING iceberg
-PARTITIONED BY (exchange, days(timestamp))
+PARTITIONED BY (days(timestamp))
 TBLPROPERTIES ('write.distribution-mode'='range', 'write.fanout.enabled'='false');
 
 -- 3. Curated Silver Table: Reconciled per-exchange (MERGE on exchange, raw_symbol, timestamp)
@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS lakehouse.silver.curated_crypto_bars (
     ingested_at TIMESTAMP
 )
 USING iceberg
-PARTITIONED BY (exchange, days(timestamp))
+PARTITIONED BY (days(timestamp))
 TBLPROPERTIES ('write.distribution-mode'='range', 'write.fanout.enabled'='false');
 
 -- 4. Curated Gold Table: Dimensional model for reporting, analytics, and ML training
@@ -98,7 +98,7 @@ CREATE TABLE IF NOT EXISTS lakehouse.gold.curated_crypto_bars (
     last_updated_at TIMESTAMP
 )
 USING iceberg
-PARTITIONED BY (days(timestamp), exchange)
+PARTITIONED BY (days(timestamp))
 TBLPROPERTIES ('write.distribution-mode'='range', 'write.fanout.enabled'='false');
 
 -- 5. Conformed Dimension: dim_symbol (SCD Type 1)
@@ -134,7 +134,7 @@ CREATE TABLE IF NOT EXISTS lakehouse.gold.agg_daily_crypto_ohlcv (
     last_updated_at TIMESTAMP
 )
 USING iceberg
-PARTITIONED BY (exchange, days(trade_date));
+PARTITIONED BY (days(trade_date));
 
 -- 7. Materialized Daily Cross-Exchange Comparison Table: agg_daily_cross_exchange_spread
 CREATE TABLE IF NOT EXISTS lakehouse.gold.agg_daily_cross_exchange_spread (
@@ -163,4 +163,21 @@ CREATE TABLE IF NOT EXISTS lakehouse.gold.pipeline_audit (
 )
 USING iceberg
 PARTITIONED BY (days(created_at));
+
+-- 9. Source Ingestion Manifest Table: Checkpointing and idempotency tracking for raw files
+CREATE TABLE IF NOT EXISTS lakehouse.bronze.source_manifest (
+    source_file STRING,
+    exchange STRING,
+    raw_symbol STRING,
+    batch_id STRING,
+    file_hash STRING,
+    record_count BIGINT,
+    min_timestamp TIMESTAMP,
+    max_timestamp TIMESTAMP,
+    status STRING,
+    processed_at TIMESTAMP
+)
+USING iceberg
+PARTITIONED BY (days(processed_at));
+
 

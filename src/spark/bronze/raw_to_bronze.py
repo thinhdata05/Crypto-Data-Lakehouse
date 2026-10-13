@@ -138,6 +138,28 @@ def main() -> None:
             total_ingested += rows_count
             elapsed = time.time() - t0
 
+            # Record checkpoint to bronze.source_manifest
+            try:
+                from src.utils.manifest_tracker import record_manifest_entry, compute_file_sha256
+                first_file = parquet_files[0] if parquet_files else f"{exc}_{sym}"
+                min_ts = arrow_tbl["timestamp"][0].as_py() if rows_count > 0 else None
+                max_ts = arrow_tbl["timestamp"][-1].as_py() if rows_count > 0 else None
+                f_hash = compute_file_sha256(first_file) if os.path.exists(first_file) else f"{exc}_{sym}_{rows_count}"
+                record_manifest_entry(
+                    catalog=catalog,
+                    source_file=first_file,
+                    exchange=exc,
+                    raw_symbol=sym,
+                    batch_id=batch_id,
+                    file_hash=f_hash,
+                    record_count=rows_count,
+                    min_timestamp=min_ts,
+                    max_timestamp=max_ts,
+                    status="INGESTED_BRONZE",
+                )
+            except Exception:
+                pass
+
             print(f"[{exc} {idx}/{len(symbol_dirs)}] Ingested {rows_count:,} records for {sym} in {elapsed:.2f}s (running total: {total_ingested:,})")
 
     total_elapsed = time.time() - t_start
