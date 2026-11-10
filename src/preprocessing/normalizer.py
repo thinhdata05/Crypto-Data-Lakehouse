@@ -23,6 +23,52 @@ INITIAL_REALTIME_PRIORITY = 1
 HISTORICAL_PRIORITY = 2
 UPDATED_REALTIME_PRIORITY = 3
 
+SOURCE_TO_PRIORITY_MAP: Dict[str, int] = {
+    "realtime": INITIAL_REALTIME_PRIORITY,
+    "initial_realtime": INITIAL_REALTIME_PRIORITY,
+    "ws_preliminary": INITIAL_REALTIME_PRIORITY,
+    "b": INITIAL_REALTIME_PRIORITY,
+    "historical": HISTORICAL_PRIORITY,
+    "incremental": HISTORICAL_PRIORITY,
+    "rest": HISTORICAL_PRIORITY,
+    "updated_realtime": UPDATED_REALTIME_PRIORITY,
+    "ws_updated": UPDATED_REALTIME_PRIORITY,
+    "correction": UPDATED_REALTIME_PRIORITY,
+    "u": UPDATED_REALTIME_PRIORITY,
+}
+
+SOURCE_TO_PRIORITY_SQL_CASE = """
+CAST(
+    CASE
+        WHEN LOWER(TRIM(COALESCE(source, ''))) IN ('updated_realtime', 'ws_updated', 'correction', 'u') THEN 3
+        WHEN LOWER(TRIM(COALESCE(source, ''))) IN ('realtime', 'initial_realtime', 'ws_preliminary', 'b') THEN 1
+        ELSE 2
+    END AS INTEGER
+)
+""".strip()
+
+
+def resolve_priority_from_source(
+    source: Optional[str],
+    explicit_priority: Optional[int] = None,
+) -> int:
+    """
+    Resolves intra-exchange priority (3 > 2 > 1) from explicit priority or source string.
+    - 1 (INITIAL_REALTIME_PRIORITY): Preliminary WebSocket bar (T='b', source='realtime')
+    - 2 (HISTORICAL_PRIORITY): Historical backfill & Incremental REST API (source='historical')
+    - 3 (UPDATED_REALTIME_PRIORITY): Exchange late correction (T='u', source='correction')
+    """
+    if explicit_priority is not None and explicit_priority in (
+        INITIAL_REALTIME_PRIORITY,
+        HISTORICAL_PRIORITY,
+        UPDATED_REALTIME_PRIORITY,
+    ):
+        return int(explicit_priority)
+    if not source:
+        return HISTORICAL_PRIORITY
+    key = str(source).strip().lower()
+    return SOURCE_TO_PRIORITY_MAP.get(key, HISTORICAL_PRIORITY)
+
 # Known quote currencies sorted by length descending for greedy matching
 KNOWN_QUOTE_CURRENCIES = [
     "FDUSD",
@@ -214,6 +260,7 @@ def validate_ohlcv_record(
 OHLCV_SANITY_SQL_PREDICATE = """
     open > 0.0 AND high > 0.0 AND low > 0.0 AND close > 0.0
     AND volume >= 0.0
+    AND (trade_count IS NULL OR trade_count >= 0)
     AND high >= low
     AND high >= open
     AND high >= close
@@ -234,6 +281,7 @@ OHLCV_VIOLATION_SQL_PREDICATE = """
     OR low <= 0.0
     OR close <= 0.0
     OR volume < 0.0
+    OR (trade_count IS NOT NULL AND trade_count < 0)
     OR open IS NULL OR high IS NULL OR low IS NULL OR close IS NULL OR volume IS NULL
 """.strip()
 

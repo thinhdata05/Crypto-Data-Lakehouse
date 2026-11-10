@@ -1,215 +1,135 @@
-# Storage Architecture & Warehouse Clarification Note
+# Kiến Trúc Lưu Trữ Lakehouse (`s3://lakehouse/`), Phân Tách Control Plane & Hội Tụ Cloud Silver
 
-> **Tài liệu làm rõ kiến trúc lưu trữ**: Phân biệt giữa thư mục cục bộ `warehouse/` (Local Staging) và kho dữ liệu thực sự `s3://warehouse/` (MinIO Object Storage) trong hệ thống Hybrid Lakehouse Crypto.
-
----
-
-## 1. Ngữ cảnh & Vấn đề thường gây hiểu lầm
-
-Khi mới tiếp cận dự án, việc nhìn thấy một thư mục mang tên `warehouse/` nằm ngay tại thư mục gốc máy cục bộ (`E:\project_hybrid_lakehouse_crypto\warehouse`) rất dễ gây ra sự hiểu lầm:
-* *Hiểu lầm:* Toàn bộ dữ liệu Data Lakehouse / Data Warehouse đang được lưu trực tiếp trên hệ thống file cục bộ của máy tính.
-* *Thực tế:* Đây **không phải** là Data Warehouse, mà chỉ là **Tầng đệm trung chuyển (Staging Zone)**. Kho dữ liệu Lakehouse thực sự được lưu trên MinIO (S3 Object Storage).
+Tài liệu này định nghĩa kiến trúc lưu trữ chuẩn của dự án **Multi-Exchange Crypto Lakehouse Platform**: lý do sử dụng bucket `s3://lakehouse/`, sự phân tách giữa **Control Plane (`lakehouse.ops`)** và **Data Plane (`bronze`, `silver`, `gold`)**, vai trò thực sự của tầng đệm local `./staging`, và kiến trúc **Phase 2 Hybrid (Option 1 — 2 Medallion song song hội tụ tại Cloud Silver `silver.bars`)**.
 
 ---
 
-## 2. Phân tích chi tiết 2 vùng lưu trữ
+## 1. Tại Sao Lưu Trữ Trong Bucket `s3://lakehouse/`?
 
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│                              HOST MACHINE                              │
-│                                                                        │
-│   E:\project_hybrid_lakehouse_crypto\warehouse\                        │
-│   └── staging\canonical\                                               │
-│       ├── alpaca\                                                      │
-│       └── binance\                                                     │
-│            │ (Transient / Preprocessed Parquet)                        │
-│            ▼                                                           │
-│   [Mounted to Container as /home/iceberg/warehouse_local]              │
-└────────────────────────────────────┬───────────────────────────────────┘
-                                     │ Read by PyIceberg / Spark
-                                     ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│                        DOCKER / CLOUD INFRASTRUCTURE                   │
-│                                                                        │
-│   MinIO Object Storage (s3://warehouse/)                               │
-│   ├── bronze.db/                                                       │
-│   │   └── crypto_bars/                                                 │
-│   │       ├── metadata/ (*.metadata.json, *.avro)                      │
-│   │       └── data/ (partitioned parquet by exchange & day)            │
-│   ├── silver.db/                                                       │
-│   ├── curated_silver.db/                                               │
-│   └── gold.db/                                                         │
-│                                                                        │
-│   ★ ĐÂY MỚI LÀ LAKEHOUSE THỰC SỰ (Managed by Iceberg REST Catalog)    │
-└────────────────────────────────────────────────────────────────────────┘
-```
+Trong cấu hình của Apache Iceberg và Spark (`spark.sql.catalog.lakehouse.warehouse`), từ khóa `warehouse` chỉ là **tên tham số cấu hình (config key)** chỉ định đường dẫn gốc của Catalog, hoàn toàn không bắt buộc tên bucket vật lý phải là `warehouse`.
 
-### A. Thư mục `warehouse/` tại Local — Bản chất là Staging Area
-- **Đường dẫn vật lý:** `E:\project_hybrid_lakehouse_crypto\warehouse\staging\canonical`
-- **Mục đích sử dụng:**
-  1. Khi chạy bước tiền xử lý (`src/preprocessing/alpaca.py`, `binance.py`) hoặc khi Airflow chạy REST API fetcher (`src/incremental/rest_fetcher.py`), dữ liệu từ `raw/` được phân tích, bóc tách ký hiệu cặp tiền (base/quote), chuyển đổi timestamp sang UTC chuẩn và làm sạch schema.
-  2. Dữ liệu chuẩn hóa này được ghi tạm ra các file Parquet tại thư mục này để tạo thành một tầng dữ liệu "canonical staging".
-  3. Spark hoặc PyIceberg (`src/spark/bronze/raw_to_bronze.py`) sẽ đọc từ thư mục đệm này để ingest vào bảng Iceberg Bronze.
-- **Đặc điểm:**
-  - **Tính chất dữ liệu:** Dữ liệu phái sinh, tạm thời (Derived / Transient data).
-  - **Độ an toàn:** Hoàn toàn có thể xóa thư mục này đi mà không mất mát dữ liệu gốc, vì bất cứ lúc nào cũng có thể tái tạo lại từ `raw/` bằng script tiền xử lý.
-
-### B. Kho `s3://warehouse/` trên MinIO — Lakehouse Storage thực sự
-- **Địa chỉ lưu trữ:** `s3://warehouse/` (được phục vụ bởi container `minio:9000`).
-- **Quản lý Catalog:** `lakehouse-iceberg-rest` (Apache Iceberg REST Catalog fixture tại cổng `8181`).
-- **Mục đích sử dụng:**
-  - Đây là nơi lưu trữ toàn bộ các bảng Medallion chính thức theo chuẩn **Apache Iceberg Table Format**:
-    - `bronze.crypto_bars`: Bảng thô hợp nhất đa sàn.
-    - `silver.crypto_bars_standardized`: Bảng làm sạch và lọc lỗi.
-    - `curated_silver.crypto_bars_curated`: Bảng giải quyết ưu tiên (Priority Merge).
-    - `gold.fact_crypto_bars` & `gold.dim_date`: Bảng dữ liệu chiều (Star Schema) phục vụ phân tích.
-  - Mỗi bảng chứa đầy đủ:
-    - Metadata snapshots (`metadata/*.metadata.json`).
-    - Manifest list & manifest files (`metadata/*.avro`).
-    - Dữ liệu phân vùng Parquet tối ưu (`data/exchange=.../timestamp_day=.../*.parquet`).
+Dự án đặt tên bucket vật lý trên MinIO S3 là **`s3://lakehouse/`** (với DNS alias `lakehouse.minio` trên mạng `lakehouse-net`) vì 3 lý do cốt lõi:
+1. **Đúng bản chất kiến trúc**: Hệ thống lưu trữ dữ liệu mở (Open Table Format Apache Iceberg trên Parquet) kết hợp khả năng ACID của Data Warehouse và tính linh hoạt của Data Lake.
+2. **Tách biệt rõ khỏi thư mục local**: Ngăn chặn mọi nhầm lẫn giữa thư mục đệm trên ổ cứng máy chủ (`./staging`) và kho lưu trữ đối tượng thực sự trên MinIO (`s3://lakehouse/`).
+3. **Đồng bộ tên Catalog và Bucket**: Tên Catalog (`lakehouse`) trùng khớp trực tiếp với URI lưu trữ (`s3://lakehouse/`).
 
 ---
 
-## 3. Cơ chế ánh xạ trong `docker-compose.yml`
+## 2. Phân Tách Control Plane (`lakehouse.ops`) & Data Plane (`bronze`, `silver`, `gold`)
 
-Trong [docker-compose.yml](../../docker-compose.yml), cấu hình mount thư mục cho Spark container được thiết kế như sau:
-
-```yaml
-spark-iceberg:
-  volumes:
-    - warehouse_data:/home/iceberg/warehouse          # [1] Volume Docker nội bộ của Spark
-    - ./warehouse:/home/iceberg/warehouse_local       # [2] Mount thư mục local từ máy Host
-```
-
-1. **`warehouse_data:/home/iceberg/warehouse`**: Volume nội bộ của Spark container dùng để lưu cache/scratchpad.
-2. **`./warehouse:/home/iceberg/warehouse_local`**: Để tránh xung đột tên với thư mục `/home/iceberg/warehouse` của container, thư mục `./warehouse` từ máy chủ (host) được mount dưới tên định danh rõ ràng là `/home/iceberg/warehouse_local`.
-
----
-
-## 4. Bảng đối chiếu tóm tắt
-
-| Tiêu chí so sánh | `warehouse/` (Local Host) | `s3://warehouse/` (MinIO) |
-| :--- | :--- | :--- |
-| **Vị trí vật lý** | Ổ cứng máy chủ (`E:\project_...`) | Docker Named Volume (`minio_data`) |
-| **Bản chất kiến trúc** | **Staging Area** (Vùng đệm xử lý) | **Data Lakehouse** (Storage chính thức) |
-| **Định dạng dữ liệu** | Parquet thuần túy | Apache Iceberg (Parquet + Avro Metadata) |
-| **Các tầng dữ liệu** | Chỉ chứa staging canonical | Đầy đủ: Bronze, Silver, Curated Silver, Gold |
-| **Ảnh hưởng khi xóa** | Không mất dữ liệu, tạo lại được | Mất dữ liệu bảng Iceberg & snapshot lịch sử |
-
----
-
-## 5. Khuyến nghị kiến trúc (Architecture Recommendation)
-
-1. **Về việc đặt tên:** Trong tương lai, nếu thực hiện refactor kiến trúc:
-   - Thư mục `./warehouse` trên host nên được đổi tên thành `./staging` hoặc `./data/staging`.
-   - Cập nhật ánh xạ mount trong `docker-compose.yml` thành:
-     `- ./staging:/home/iceberg/staging`
-   - Điều này sẽ loại bỏ hoàn toàn sự nhập nhằng giữa "Staging trên đĩa" và "Warehouse trên Object Storage".
-2. **Quản lý dung lượng đĩa:** Sau khi toàn bộ dữ liệu lịch sử đã được nạp thành công vào Iceberg Bronze/Silver (`s3://warehouse/`), bạn có thể dọn dẹp các thư mục con trong `warehouse/staging/canonical/` nếu ổ cứng cần giải phóng dung lượng.
-
----
-
-## 6. Thiết kế Bucket S3/MinIO: Hiện trạng & Đề xuất Mô hình Multi-Bucket
-
-### A. Hiện trạng của dự án hiện tại (Mô hình Lai - Hybrid)
-* **Tầng Raw & Staging:** Lưu tại ổ cứng Local (`E:\project_hybrid_lakehouse_crypto\raw` và `./warehouse/staging`), bind-mount vào container.
-* **Tầng Iceberg Lakehouse (Bronze, Silver, Gold):** Lưu tại MinIO Bucket `s3://warehouse/` qua Iceberg REST Catalog.
-* **Bucket `lakehouse`:** Đã được tạo sẵn trong `mc` init script nhưng hiện để trống dự phòng.
-
-### B. Đề xuất nâng cấp: Mô hình Multi-Bucket (Chuẩn Production / Enterprise)
-Để hệ thống trở thành **100% Cloud-Native** và đạt chuẩn kiến trúc bảo mật IAM doanh nghiệp, lộ trình chuyển đổi đề xuất như sau:
+Theo chuẩn kiến trúc Data Engineering hiện đại, các bảng quản trị vận hành (Operational Metadata, Lineage, Audit) **không được đặt lẫn lộn** vào trong các namespace dữ liệu nghiệp vụ (`bronze`, `silver`, `gold`). Hệ thống phân tách thành 2 mặt phẳng độc lập trên `s3://lakehouse/`:
 
 ```text
-MinIO / AWS S3
-├── 📦 lakehouse-raw/                 # [Chỉ Ingestion Service được ghi]
-│   ├── alpaca/bars/...
-│   └── binance/kline/...
+s3://lakehouse/
+├── ops/                             # CONTROL PLANE (Quản trị vận hành & Kiểm toán)
+│   ├── ingestion_manifest/          # Kiểm soát lũy kế file-level SHA-256 (days(processed_at))
+│   └── pipeline_audit/              # Telemetry & lịch sử thực thi pipeline (days(created_at))
 │
-├── 📦 lakehouse-warehouse/           # [Trỏ cho Iceberg REST Catalog: s3://lakehouse-warehouse/]
-│   ├── bronze/                       # Bảng bronze.crypto_bars
-│   ├── silver/                       # Bảng silver.crypto_bars_standardized
-│   ├── curated_silver/               # Bảng curated_silver.crypto_bars_curated
-│   └── gold/                         # Bảng fact & dimensional models
+├── bronze/                          # DATA PLANE — Tầng 1: Bất biến (Append-Only)
+│   ├── crypto_bars/                 # [Local] Dữ liệu lịch sử & REST API (104,706,818 dòng, 2,071 file)
+│   └── rt_bars/                     # [Cloud] Dữ liệu WebSocket thời gian thực (WS Alpaca + WS Binance)
 │
-└── 📦 lakehouse-system/              # [Tự động dọn dẹp theo Lifecycle Rules]
-    ├── staging/                      # Thay thế thư mục warehouse/ local
-    ├── checkpoints/                  # Spark / Engine checkpoints
-    └── logs/                         # Airflow remote task logs
+├── silver/                          # DATA PLANE — Tầng 2: Làm sạch, Gán Priority & Khử trùng lặp
+│   └── bars/                        # Bảng Silver chuẩn duy nhất (104,657,836 dòng, 2,058 file)
+│
+└── gold/                            # DATA PLANE — Tầng 3: Phục vụ Phân tích (Duy nhất trên Cloud)
+    ├── dim_symbol/                  # Chiều danh mục 68 symbols (SCD Type 1)
+    ├── dim_date/                    # Chiều thời gian lịch chuẩn
+    ├── agg_daily_crypto_ohlcv/      # Tổng hợp OHLCV & VWAP theo ngày (days(trade_date))
+    └── agg_daily_cross_exchange_spread/ # Tổng hợp chênh lệch giá liên sàn theo ngày
 ```
 
-* **Lợi ích khi nâng cấp:**
-  1. Loại bỏ hoàn toàn sự phụ thuộc vào filesystem cục bộ của máy Host.
-  2. Phân quyền IAM rõ ràng theo nguyên tắc Least Privilege (Analyst chỉ đọc Gold, ETL ghi Bronze/Silver).
-  3. Cài đặt Lifecycle Policy (TTL) an toàn cho logs/staging mà không sợ ảnh hưởng đến dữ liệu nghiệp vụ.
+### Vì Sao Chỉ Duy Trì Một Bảng `silver.bars` Duy Nhất (Bỏ Thiết Kế Tách Đôi Silver)?
+- Ở thiết kế sơ khai, tầng Silver bị tách thành 2 bảng vật lý (`silver.crypto_bars` và `silver.curated_crypto_bars`), dẫn đến việc phải ghi và lưu trữ trùng lặp 104.7 triệu dòng hai lần trên đĩa mà không mang lại giá trị nghiệp vụ mới.
+- Trong kiến trúc chuẩn hiện tại, cả Local và Cloud đều thống nhất một bảng **`lakehouse.silver.bars`** duy nhất:
+  - Thực hiện trọn vẹn trong **1 bước вектор hóa (Single-Pass DuckDB Vectorization)**:
+    1. Kiểm tra 7 quy tắc toán học OHLCV (`OHLCV_SANITY_SQL_PREDICATE`).
+    2. Gán trọng số ưu tiên động `priority` ($3 > 2 > 1$).
+    3. Khử trùng lặp tuyệt đối theo khóa chính `(exchange, raw_symbol, timestamp)` với thứ tự ưu tiên `ORDER BY priority DESC, ingested_at DESC`.
 
 ---
 
-## 7. Chiến Lược Di Cư Phase 2 Lên Cloud (AWS): Dual-Catalog Migration (Cách 1)
+## 3. Phân Định Rõ Vai Trò Giữa `./raw`, `./staging` Và `s3://lakehouse/`
 
-### A. Mô hình kiến trúc Dual-Catalog
-Thay vì upload file thủ công dễ gây lỗi lệch đường dẫn metadata (broken pointer) trong bảng Iceberg, phương pháp chuẩn được lựa chọn là **Dual-Catalog Replication qua PyIceberg**:
+| Thành Phần | Vị Trí Vật Lý | Bản Chất & Nhiệm Vụ | Lưu Trữ Lâu Dài? |
+| :--- | :--- | :--- | :---: |
+| **`./raw/`** | Ổ cứng Host (`E:\...\raw\`) | Nguồn dữ liệu thô ban đầu: **87,693 file Parquet nhỏ lẻ theo ngày** (`38,677` file Alpaca + `49,016` file Binance). | Có (Read-Only Backup) |
+| **`./staging/canonical/`** | Ổ cứng Host (`E:\...\staging\canonical\`) | **Tầng đệm Pre-Bronze (Coalescing Buffer)**: Gom 87,693 file ngày thành **2,939 file tháng**, đồng nhất kiểu dữ liệu `int64`/`double` (`promote_options="permissive"`), và lọc giữ 68 cặp thanh khoản chính. | Không (Có thể xóa sau khi nạp Bronze) |
+| **`./staging/confirmed/`** | Ổ cứng Host (`E:\...\staging\confirmed\`) | **Tầng đệm Outbox cho Cloud**: Chứa các lát cắt Parquet hàng giờ (`alpaca_bars.parquet`, `binance_bars.parquet`) + `_manifest.json` để đẩy lên Cloud S3 `confirmed/`. | Không (TTL 7 ngày) |
+| **`s3://lakehouse/`** | MinIO Volume (`docker_data.vhdx`) | **Kho Data Lakehouse chính thức**: Chứa toàn bộ bảng Iceberg (`ops.*`, `bronze.crypto_bars`, `silver.bars`) kèm metadata, snapshots và manifest lists. | **CÓ (Authoritative Storage)** |
+
+---
+
+## 4. Giải Thích Chi Tiết Luồng Nạp Dữ Liệu Hiện Tại (Data Ingestion Flow)
+
+### A. Câu Hỏi Cốt Lõi: Tại Sao Không Đẩy Thẳng 87,693 File `./raw` Vào `bronze.crypto_bars` Mà Đi Qua `./staging/canonical`?
+1. **Vấn đề kỹ thuật của `./raw`**:
+   - Thư mục `./raw` chứa **87,693 file Parquet rời rạc theo từng ngày** (mỗi file chỉ vài KB đến vài chục KB). Nếu mở giao dịch Iceberg append trực tiếp 87,693 lần hoặc đọc từng file qua S3 API, hệ thống sẽ bị nghẽn I/O nghiêm trọng.
+   - Ngoài ra, dữ liệu thô của Alpaca có hiện tượng **trôi kiểu dữ liệu (Schema Drift)**: những ngày không có giao dịch thì cột `volume` có kiểu `int64` (`0`), còn những ngày có giao dịch lại mang kiểu `double`, gây lỗi `ArrowInvalid: Unable to merge: Field volume has incompatible types: double vs int64` trên 123 tháng dữ liệu.
+2. **Cách hoạt động hiện tại của Preprocessor (`alpaca.py` & `binance.py`)**:
+   - Đọc song song đa tiến trình (`ProcessPoolExecutor`), dùng `pa.concat_tables(tables, promote_options="permissive")` để tự động nâng cấp `int64 -> double` (cứu toàn bộ **123 tháng = 3,653,460 dòng** của Alpaca), lọc giữ 68 symbols chuẩn theo thứ tự thanh khoản (`USDT > USDC > USD > BTC`), và gom thành **2,939 file Parquet theo tháng** tại `./staging/canonical/`.
+   - **Lưu ý trung thực về mặt lý thuyết Medallion**: Hiện tại trong `alpaca.py` và `binance.py` có thực hiện lọc sơ bộ `timestamp >= 2021-01-01` và `open > 0 & high >= low & volume >= 0` ngay khi tạo file canonical. Do đó, dữ liệu khi vào `bronze.crypto_bars` (`104,706,818` dòng) là **Canonical Raw Bars** (đã chuẩn hóa cấu trúc cột và lọc sơ bộ nến rác âm/trước 2021), chứ chưa phải là bản dump thô nguyên xi 100% của các cặp tiền phụ.
+
+### B. Luồng Nạp Từ `./staging/canonical` Vào `lakehouse.bronze.crypto_bars` (`raw_to_bronze.py`)
+1. **Kiểm tra lũy kế cấp độ file (Per-File SHA-256 Gate)**:
+   - Tải danh sách mã băm SHA-256 từ `lakehouse.ops.ingestion_manifest`. Mọi file `.parquet` đã từng nạp sẽ được bỏ qua tức thì (`SKIP`).
+2. **Gom nhóm theo Quý căn chỉnh phân vùng (Partition-Aligned Quarter Batching `YYYY-Q1..Q4`)**:
+   - Thay vì lặp qua từng symbol ở vòng lặp ngoài (gây ra $68 \times 1,300 = 84,149$ file nhỏ làm phình `docker_data.vhdx` lên 86 GB như trước đây), `raw_to_bronze.py` gom **toàn bộ 68 symbols trong cùng một Quý (`YYYY-Q1..Q4`)** thành một bảng PyArrow duy nhất rồi mới gọi `table.append()`.
+   - Nhờ bảng Iceberg được phân vùng theo `days(timestamp)`, mỗi ngày UTC chỉ sinh ra đúng **1 file Parquet hợp nhất** chứa đủ 68 symbols.
+   - **Kết quả**: Nạp **104,706,818 dòng** vào `bronze.crypto_bars` chỉ sinh ra đúng **2,071 file Parquet** (giảm **41 lần** số file!).
+
+### C. Luồng Biến Đổi Từ `bronze.crypto_bars` Sang `lakehouse.silver.bars` (`bronze_to_silver.py`)
+1. **Streaming theo từng Tháng lịch (`YYYY-MM`)**:
+   - Đọc dữ liệu từ `bronze.crypto_bars` theo từng cửa sổ 1 tháng (`[YYYY-MM-01T00:00:00+00:00, next_month)`), mỗi tháng khoảng `1.0M – 2.4M` dòng trên toàn bộ 68 symbols (`Peak RAM < 800 MB`).
+   - Hỗ trợ **Monthly Checkpoint Resume**: Tự động kiểm tra xem tháng `YYYY-MM` đã có trong `silver.bars` chưa; nếu có rồi thì `SKIP` ngay lập tức (trừ khi truyền cờ `--force-replay`).
+2. **Xử lý Vector hóa trong DuckDB In-Process**:
+   - **Lọc đủ các điều kiện toán học OHLCV và tính toàn vẹn giao dịch**:
+     $$\text{open, high, low, close} > 0 \;\land\; \text{high} \ge \text{low} \;\land\; \text{high} \ge \text{open} \;\land\; \text{high} \ge \text{close} \;\land\; \text{low} \le \text{open} \;\land\; \text{low} \le \text{close} \;\land\; \text{volume} \ge 0 \;\land\; (\text{trade\_count IS NULL} \lor \text{trade\_count} \ge 0)$$
+   - **Gán trọng số ưu tiên động (`priority`)**:
+     - `source = 'correction'` $\to$ `priority = 3`
+     - `source = 'historical'` $\to$ `priority = 2`
+     - `source = 'realtime'` $\to$ `priority = 1`
+   - **Khử trùng lặp tuyệt đối theo khóa chính**:
+     ```sql
+     QUALIFY ROW_NUMBER() OVER (
+         PARTITION BY exchange, raw_symbol, timestamp
+         ORDER BY priority DESC, ingested_at DESC
+     ) = 1
+     ```
+3. **Kết quả thực tế**:
+   - Từ **104,706,818 dòng** ở `bronze.crypto_bars`, tầng Silver đã lọc bỏ **48,982 dòng** trùng lặp/vi phạm 7 quy tắc OHLCV và ghi chính xác **104,657,836 dòng** sạch vào **2,058 file Parquet** trong `lakehouse.silver.bars` với tốc độ **986,372 dòng/giây**!
+
+---
+
+## 5. Kiến Trúc Phase 2 Hybrid: 2 Medallion Song Song Hội Tụ Tại Cloud Silver (Option 1)
+
+Để kết hợp luồng Historical/REST tại Local với luồng WebSocket 24/7 trên Cloud mà **không cần đồng bộ qua lại 2 chiều** và **không bao giờ bị xung đột khóa Iceberg Catalog qua mạng WAN**, hệ thống áp dụng mô hình **Option 1 (Local Lightweight Producer — Single Cloud Gold)**:
 
 ```text
-[Local Environment]                                  [AWS Cloud Platform]
-┌────────────────────────┐                          ┌────────────────────────┐
-│  MinIO (s3://warehouse)│                          │  Amazon S3             │
-│  └── gold.curated_...  │                          │  └── (crypto-gold-...) │
-└───────────┬────────────┘                          └───────────▲────────────┘
-            │                                                   │
-            │ (1) Scan to Arrow                                 │ (2) Append stream
-            ▼                                                   │
-   ┌─────────────────┐                                          │
-   │  Python Script  │ ─────────────────────────────────────────┘
-   │  (PyIceberg)    │
-   └────────┬────────┘
-            │ (3) Tự động đăng ký Snapshot & Schema
-            ▼
-┌────────────────────────┐
-│  AWS Glue Data Catalog │ ◄────── [Amazon Athena / BI Tools / Analysts]
-└────────────────────────┘
+LOCAL (`s3://lakehouse/`)                          CLOUD (`s3://<cloud>-lakehouse/`)
+─────────────────────────                          ─────────────────────────────────
+raw/ ─► staging/canonical/                         WS Alpaca + WS Binance ─► Kafka
+     ─► bronze.crypto_bars                                                    │
+     ─► silver.bars (priority = 2)                                            ▼
+          │ (Dừng tại silver.bars,                                    bronze.rt_bars
+          │  KHÔNG tạo Gold ở Local)                               (priority = 1, 3)
+          ▼                                                                   │
+  publish_confirmed_parquet.py                                                │
+          │                                                                   ▼
+          └──► confirmed/ (Parquet + _manifest.json) ───────────► Cloud Single-Writer Convergence Service (AWS)
+               (+ Kế hoạch Cold Bootstrap 104.66M dòng 1 lần đầu)               (Single Writer)
+                                                                              │
+                                                                              ▼
+                                                                        silver.bars
+                                                                   (Best Truth: 1 + 2 + 3)
+                                                                              │
+                                                                              ▼
+                                                                   gold.* (Single Source of Truth)
 ```
 
-### B. Mã nguồn triển khai mẫu (Workflow Pattern)
-```python
-import os
-from pyiceberg.catalog import load_catalog
-
-# 1. Kết nối Catalog Local (MinIO)
-local_catalog = load_catalog(
-    "local_lakehouse",
-    **{
-        "type": "rest",
-        "uri": "http://localhost:8181",
-        "s3.endpoint": "http://localhost:9000",
-        "s3.access-key-id": "admin",
-        "s3.secret-access-key": "password",
-    }
-)
-
-# 2. Kết nối Catalog Cloud (AWS Glue)
-cloud_catalog = load_catalog(
-    "aws_glue",
-    **{
-        "type": "glue",
-        "warehouse": "s3://my-aws-crypto-lakehouse-gold/",
-        "client.region": "us-east-1",
-    }
-)
-
-# 3. Đọc dữ liệu từ bảng Gold cục bộ
-local_gold = local_catalog.load_table("gold.curated_crypto_bars")
-arrow_data = local_gold.scan().to_arrow()
-
-# 4. Ghi trực tiếp sang AWS S3 và tự động tạo metadata chuẩn trên Glue
-cloud_gold = cloud_catalog.load_table("gold.curated_crypto_bars")
-cloud_gold.append(arrow_data)
-```
-
-### C. Lợi thế kỹ thuật & Tối ưu chi phí
-1. **Tiết kiệm tối đa chi phí AWS (Zero Compute Cost):** 100% công đoạn tính toán nặng (101 triệu dòng) đã thực hiện xong ở local. AWS chỉ đóng vai trò lưu trữ tĩnh S3 (khoảng $0.023 / GB / tháng) và Glue Catalog (miễn phí 1 triệu metadata requests).
-2. **Metadata toàn vẹn 100%:** PyIceberg tự động tạo metadata file với URI `s3://...` chuẩn của AWS, không sợ bị lỗi broken paths như khi copy file thô.
-3. **Sẵn sàng truy vấn tức thì (Serverless):** Ngay sau khi hoàn tất, bảng có thể truy vấn ngay lập tức bằng **Amazon Athena** (`SELECT * FROM gold.curated_crypto_bars ...`) mà không cần tốn chi phí dựng cụm EMR hay Spark cluster chạy 24/7.
-
-> **Ghi chú về định hướng thiết kế:** Tài liệu đặc tả ban đầu (`PROJECT_LAKEHOUSE_MIGRATION_SPEC_FINAL.md`) mang tính chất tham khảo tổng quan. Trong thực tế triển khai, hệ thống sẽ ưu tiên các giải pháp hiện đại, tối ưu thực chiến (Modern Data Stack: DuckDB, PyIceberg, AWS S3, AWS Glue, Athena) thay vì bị ràng buộc bởi các thiết kế cồng kềnh lý thuyết.
-
-
+1. **Tại sao Local dừng ở `silver.bars` (Option 1 — Chống Split-Brain)?**
+   - Trong kiến trúc đề xuất cho Phase 2, luồng WebSocket (`priority = 1` và đặc biệt là bản đính chính `priority = 3`) chỉ đi vào Cloud (`bronze.rt_bars`). Nếu Local tự tính bảng `gold.*` hàng giờ mà thiếu các bản ghi `priority = 3` trên Cloud, số liệu Gold giữa Local và Cloud sẽ lệch nhau (Split-Brain).
+   - Do đó, Local đóng vai trò **Lightweight Producer**: dừng tại `silver.bars` và xuất bản lát cắt Parquet bất biến + `_manifest.json` sang `confirmed/`.
+2. **Tại sao kiến trúc Cloud đề xuất thu thập WebSocket từ cả 2 sàn (`WS Alpaca + WS Binance`)?**
+   - Bảng chênh lệch giá `v_daily_cross_exchange_normalized_spread` và API `query_minute_spread.py` thực hiện `INNER JOIN` giữa Alpaca và Binance. Nếu chỉ thu thập WebSocket của 1 sàn, 60 phút gần nhất sẽ bị rỗng (`NULL`) khi chờ REST của sàn kia.
+   - Hơn nữa, Binance chiếm hơn **98% thanh khoản khám phá giá** (khối lượng BTC gấp **50.4 lần** Alpaca), và Binance WebSocket hoàn toàn miễn phí.

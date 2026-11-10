@@ -1,7 +1,9 @@
 """
-Airflow DAG: Lakehouse Incremental Hourly Sync.
-Runs periodically every hour to reconcile incremental windows, late arriving bars,
-and exchange corrections into Curated Gold using priority resolution.
+Airflow DAG: Lakehouse Incremental Hourly Producer (Phase 2 Hybrid Option 1).
+Runs periodically every hour to fetch REST API bars (Alpaca & Binance, priority=2),
+reconcile into Local Silver (`lakehouse.silver.bars`),
+and publish immutable Parquet slices + `_manifest.json` to `confirmed/` for Cloud Silver convergence.
+Local stops at Silver (`silver.bars`); Gold is materialized exclusively on Cloud (Single Source of Truth).
 """
 
 from datetime import datetime, timedelta, timezone
@@ -31,8 +33,8 @@ def build_hourly_window(**context) -> dict:
         end_dt = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     start_dt = end_dt - timedelta(hours=1)
     window = {
-        "start": start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "end": end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "start": start_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+        "end": end_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
         "batch_id": str(uuid.uuid4()),
     }
     print(f"Hourly Window: {window['start']} -> {window['end']} (Batch: {window['batch_id']})")
@@ -46,7 +48,7 @@ with DAG(
     catchup=False,
     max_active_runs=1,
     tags=["lakehouse", "iceberg", "incremental", "hourly"],
-    description="Hourly incremental synchronization and priority reconciliation into Curated Gold",
+    description="Hourly incremental REST reconciliation into Silver (silver.bars) and immutable Parquet publishing to confirmed/ (Option 1 Producer)",
 ) as dag:
 
     start_sync = EmptyOperator(task_id="start_sync")
@@ -63,7 +65,7 @@ with DAG(
         BATCH_ID="{{ ti.xcom_pull(task_ids='build_hourly_window')['batch_id'] }}"
         echo "TASK: Fetching REST API Bars (Batch: $BATCH_ID)..."
         docker exec lakehouse-spark-iceberg python3 \
-            /home/iceberg/src/incremental/rest_fetcher.py \
+            /home/iceberg/src/pipeline/incremental/rest_fetcher.py \
             --batch-id "$BATCH_ID" \
             --limit 60
         """,
@@ -76,19 +78,7 @@ with DAG(
         BATCH_ID="{{ ti.xcom_pull(task_ids='build_hourly_window')['batch_id'] }}"
         echo "TASK: Appending Incremental to Bronze..."
         docker exec lakehouse-spark-iceberg python3 \
-            /home/iceberg/src/spark/bronze/raw_to_bronze.py \
-            --batch-id "$BATCH_ID"
-        """,
-    )
-
-    incremental_silver = BashOperator(
-        task_id="incremental_bronze_to_silver",
-        bash_command="""
-        set -e
-        BATCH_ID="{{ ti.xcom_pull(task_ids='build_hourly_window')['batch_id'] }}"
-        echo "TASK: Cleansing Incremental to Silver..."
-        docker exec lakehouse-spark-iceberg python3 \
-            /home/iceberg/src/spark/silver/bronze_to_silver.py \
+            /home/iceberg/src/pipeline/bronze/raw_to_bronze.py \
             --batch-id "$BATCH_ID"
         """,
     )
@@ -100,22 +90,37 @@ with DAG(
         BATCH_ID="{{ ti.xcom_pull(task_ids='build_hourly_window')['batch_id'] }}"
         W_START="{{ ti.xcom_pull(task_ids='build_hourly_window')['start'] }}"
         W_END="{{ ti.xcom_pull(task_ids='build_hourly_window')['end'] }}"
-        echo "TASK: Reconciling & MERGE INTO Curated Silver and Gold (Window: $W_START to $W_END)..."
+        echo "TASK: Cleansing & Reconciling into Local Silver (silver.bars, Window: $W_START to $W_END)..."
         docker exec lakehouse-spark-iceberg python3 \
-            /home/iceberg/src/spark/incremental/incremental_sync.py \
+            /home/iceberg/src/pipeline/incremental/incremental_sync.py \
             --window-start "$W_START" \
             --window-end "$W_END" \
             --batch-id "$BATCH_ID"
         """,
     )
 
-    materialize_gold = BashOperator(
-        task_id="materialize_gold_aggregates",
+    publish_confirmed = BashOperator(
+        task_id="publish_confirmed_parquet",
         bash_command="""
         set -e
-        echo "TASK: Refreshing & Materializing Gold Aggregates and Dimensions..."
+        BATCH_ID="{{ ti.xcom_pull(task_ids='build_hourly_window')['batch_id'] }}"
+        W_START="{{ ti.xcom_pull(task_ids='build_hourly_window')['start'] }}"
+        W_END="{{ ti.xcom_pull(task_ids='build_hourly_window')['end'] }}"
+
+        EXTRA_FLAGS=""
+        if [ "${CLOUD_UPLOAD_CONFIRMED:-false}" = "true" ] && [ -n "${CLOUD_CONFIRMED_S3_URI:-}" ]; then
+            echo "TASK: Publishing to Local staging AND uploading to Cloud S3 (${CLOUD_CONFIRMED_S3_URI})..."
+            EXTRA_FLAGS="--upload-to-s3 --s3-uri ${CLOUD_CONFIRMED_S3_URI}"
+        else
+            echo "TASK: Publishing to Local staging/confirmed/ (Cloud upload disabled by default)..."
+        fi
+
         docker exec lakehouse-spark-iceberg python3 \
-            /home/iceberg/src/spark/gold/materialize_gold_aggregates.py
+            /home/iceberg/src/pipeline/incremental/publish_confirmed_parquet.py \
+            --window-start "$W_START" \
+            --window-end "$W_END" \
+            --batch-id "$BATCH_ID" \
+            --source-table silver.bars $EXTRA_FLAGS
         """,
     )
 
@@ -124,10 +129,11 @@ with DAG(
         bash_command="""
         set -e
         BATCH_ID="{{ ti.xcom_pull(task_ids='build_hourly_window')['batch_id'] }}"
-        echo "TASK: Validating Data Quality & Integrity..."
+        echo "TASK: Validating Local Silver (silver.bars) Quality & Integrity..."
         docker exec lakehouse-spark-iceberg python3 \
-            /home/iceberg/src/spark/quality/data_validation.py \
-            --run-id "$BATCH_ID"
+            /home/iceberg/src/pipeline/quality/data_validation.py \
+            --run-id "$BATCH_ID" \
+            --target-table silver.bars
         """,
     )
 
@@ -138,11 +144,8 @@ with DAG(
         >> get_window
         >> fetch_rest_bars
         >> incremental_bronze
-        >> incremental_silver
         >> incremental_sync
-        >> materialize_gold
+        >> publish_confirmed
         >> validate_incremental
         >> end_sync
     )
-
-

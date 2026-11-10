@@ -1,365 +1,110 @@
-# Engineering Insights, Root Cause Analysis & Optimization Notes
+# Phân Tích Nguyên Nhân Gốc Rễ (Post-Mortems), Tối Ưu Hóa Hiệu Năng & Số Liệu Benchmark Thực Tế
 
-This document provides a detailed record of the architectural challenges, bottlenecks, root cause analyses, and solutions implemented during the Phase 1 Historical Backfill (101,053,358 records) of the Multi-Exchange Crypto Lakehouse Platform.
-
----
-
-## 1. Problem Statement & Bottlenecks Observed
-
-During the initial execution of the full historical backfill across **101,053,358 records** (spanning 2021 to 2026 for 68 symbols from Alpaca and Binance):
-1. **Preprocessing Stalling**: The Airflow preprocessing tasks (`alpaca_source_preprocessing` and `binance_source_preprocessing`) ran exceedingly slowly, taking hours with high disk I/O and CPU contention.
-2. **Spark Iceberg Write OOM Crash**: The Spark Iceberg ingestion jobs failed with:
-   ```text
-   java.lang.OutOfMemoryError: Java heap space
-       at org.apache.parquet.hadoop.InternalParquetRecordWriter...
-       at org.apache.iceberg.spark.source.SparkWrite$PartitionedFanoutWriter...
-   ```
-3. **HiveThriftServer Memory Leak**: A lingering `HiveThriftServer2 -Xmx4g` background process consumed 2.8GB to 4GB of host RAM inside the Spark container, leaving insufficient memory for Spark executors and Airflow tasks.
+> **Tài liệu kỹ thuật chuyên sâu**: Ghi nhận toàn bộ các sự cố kỹ thuật (RCA), công thức tính toán bộ nhớ/tài chính bằng toán học, giải pháp kiến trúc đã áp dụng và bảng số liệu đo lường thực nghiệm (Before vs. After) trên nền tảng **Multi-Exchange Crypto Lakehouse Platform (`s3://lakehouse/`)**.
 
 ---
 
-## 2. Root Cause Analysis (RCA)
+## 1. Post-Mortem #1: Tràn Bộ Nhớ JVM Heap Khi Ghi Đa Phân Vùng (`Spark PartitionedFanoutWriter OOM`)
 
-### RCA 1: Spark Iceberg `PartitionedFanoutWriter` Memory Explosion
-* **Partition Scheme**: The Iceberg tables are partitioned by `(exchange, days(timestamp))`.
-* **The Math of the Crash**:
-  - A historical symbol spanning 2021 to 2026 covers **~1,584 distinct days**.
-  - When writing non-presorted rows into an Iceberg table, Spark’s `FanoutWriter` opens a separate Parquet file writer for **every single partition encountered concurrently** in memory.
-  - Each active Parquet record compressor allocates a default write buffer of **64 MB to 128 MB**:
-    $$\text{Buffer Requirement} = 1,584 \text{ days} \times 64\text{ MB} \approx \mathbf{101.4\text{ GB of Java Heap}}$$
-  - Because the Spark master/executor in local Docker had a heap limit of 2.5 GB, Java immediately triggered `OutOfMemoryError`.
-  - Even with `sortWithinPartitions("exchange", "timestamp")`, sorting by microsecond timestamp across 1,584 days in arbitrary Spark shuffle partitions still forced concurrent partition writes within single executor tasks.
-
-### RCA 2: Why `write.distribution-mode = 'hash'` Was Not Sufficient on Local Single-Node Docker
-A common question in Iceberg architecture is: *Why not simply set `write.distribution-mode = 'hash'` instead of switching the write engine?*
-- In an enterprise multi-node cluster (e.g. 50 nodes with 1.6 TB RAM), setting `write.distribution-mode = 'hash'` with `spark.sql.shuffle.partitions = 3200` works because Spark distributes the 3,168 partitions ($2 \text{ exchanges} \times 1,584 \text{ days}$) across hundreds of executor cores, so each task handles only 1 partition at a time.
-- **However, on a local single-node machine (2 CPU cores, 2.5 GB RAM limit)**:
-  - If `spark.sql.shuffle.partitions` is default (200) or 16: each task receives $\approx 198$ distinct partition keys concurrently $\to 198 \times 64\text{ MB} \approx 12.6\text{ GB} \gg 2.5\text{ GB}$ heap $\to$ **Immediate JVM Heap OOM**.
-  - If `spark.sql.shuffle.partitions = 3200` (1 partition per task): Spark has to schedule 3,200 separate tasks on 2 local cores. The disk I/O from shuffle spill, block manager metadata, and Java object boxing/unboxing over 101M rows caused **10+ second GC pauses**, triggering executor heartbeat timeouts (`RpcTimeoutException: Futures timed out after 10000ms`, `Block broadcast does not exist`), causing the Spark job to abort.
-
-### RCA 2b: Empirical Verification of `write.distribution-mode = 'range'` + `write.fanout.enabled = 'false'`
-To rigorously verify whether standard Spark DataSourceV2 could be saved by official Iceberg configuration without switching engines, we conducted a live empirical benchmark (`tests/test_spark_range_write.py`) on the actual BTC-USD dataset (2,265,116 rows spanning 1,584 days):
-```sql
-CREATE TABLE lakehouse.bronze.test_spark_range (...)
-USING iceberg
-PARTITIONED BY (exchange, days(timestamp))
-TBLPROPERTIES ('write.distribution-mode'='range', 'write.fanout.enabled'='false');
-```
-* **Execution Command**:
-  ```bash
-  spark-submit --master local[2] --driver-memory 2500m --executor-memory 2500m test_spark_range_write.py
-  ```
-* **Result**: **FAILED with `java.lang.OutOfMemoryError: Java heap space` after 48.6s.**
-* **Stacktrace Evidence**:
-  ```text
-  java.lang.OutOfMemoryError: Java heap space
-      at java.base/java.io.ByteArrayOutputStream.<init>(ByteArrayOutputStream.java:81)
-      at org.apache.iceberg.shaded.org.apache.parquet.hadoop.CodecFactory$HeapBytesCompressor.<init>(CodecFactory.java:222)
-      at org.apache.iceberg.shaded.org.apache.parquet.hadoop.CodecFactory.createCompressor(CodecFactory.java:273)
-      at org.apache.iceberg.parquet.ParquetWriter.<init>(ParquetWriter.java:90)
-      at org.apache.iceberg.io.RollingDataWriter.<init>(RollingDataWriter.java:47)
-      at org.apache.iceberg.io.FanoutDataWriter.newWriter(FanoutDataWriter.java:53)
-      at org.apache.iceberg.io.FanoutWriter.writer(FanoutWriter.java:64)
-      at org.apache.iceberg.io.FanoutWriter.write(FanoutWriter.java:52)
-      at org.apache.iceberg.spark.source.SparkWrite$PartitionedDataWriter.write(SparkWrite.java:781)
-  ```
-* **Why `write.fanout.enabled='false'` still triggered `FanoutDataWriter`**:
-  1. In Iceberg's DataSourceV2 writer (`SparkWrite.java`), setting `fanout.enabled=false` tells Iceberg to use a single rolling writer *under the assumption that rows arrive strictly sorted by the partition key*.
-  2. However, Spark's `range` distribution mode only partitions data into coarse quantile ranges across Spark tasks; it **does not** guarantee strict intra-task ordering by Iceberg's partition transform (`days(timestamp)`).
-  3. When Iceberg's writer encounters out-of-order partition transitions within the same task stream, it automatically falls back to `FanoutDataWriter` (or throws an illegal state exception).
-  4. Once `FanoutDataWriter` is engaged, it concurrently instantiates `HeapBytesCompressor` instances for the 1,584 distinct day partitions. At 64MB buffer each, the 2.5GB JVM heap is exhausted almost immediately.
-
-### RCA 2c: Dead Config Analysis for PyIceberg
-* **Are `write.distribution-mode` and `write.fanout.enabled` active in PyIceberg?**
-  - **No, they are dead config for PyIceberg.**
-  - These properties are Spark DataSourceV2-specific engine directives recognized only by `org.apache.iceberg.spark.source.SparkWrite`.
-  - PyIceberg executes writes using Apache Arrow's native C++ streaming writer (`pyarrow.dataset.write_dataset`). PyIceberg streams symbol by symbol, writing Parquet files in native off-heap memory without invoking any Java JVM or Spark distribution logic.
-  - The properties remain in the DDL as table-level metadata for any external Spark batch consumers, but have zero effect on PyIceberg's C++ write path.
-
-### RCA 3: Preprocessing I/O & CPU Bottleneck
-* **Quote Currency Redundancy**: Binance raw data contains numerous duplicate pairs for the same base token (`BTCUSDT`, `BTCUSDC`, `BTCTUSD`, `BTCBUSD`, `BTCFDUSD`). Parsing, verifying, and validating all quote pairs multiplied the data volume and file count unnecessarily.
-* **Small File Fragmentation**: Raw source archives contained thousands of tiny files. Reading and appending file-by-file with Pandas incurred extreme Python interpreter overhead, GIL contention, and repeated file descriptor allocation.
-
----
-
-## 3. Implemented Solutions
-
-### Solution 1: Zero-JVM-Heap Streaming Engine (PyIceberg + DuckDB)
-
-Instead of relying on Spark JVM execution for row-by-row partition fanout, we implemented an out-of-core streaming architecture using **PyIceberg**, **PyArrow**, and **DuckDB**:
-
-```
- ┌─────────────────────────────────────────────────────────────┐
- │                  MinIO S3 / Local Parquet                   │
- └──────────────────────────────┬──────────────────────────────┘
-                                │ PyIceberg / PyArrow C++ Zero-Copy Scan
-                                ▼
- ┌─────────────────────────────────────────────────────────────┐
- │                  In-Memory Arrow RecordBatch                │
- └──────────────────────────────┬──────────────────────────────┘
-                                │ Vectorized DuckDB SIMD Queries
-                                ▼
- ┌─────────────────────────────────────────────────────────────┐
- │   DuckDB: Market Sanity + Priority Resolution + Dedup       │
- │   QUALIFY ROW_NUMBER() OVER (                               │
- │       PARTITION BY exchange, raw_symbol, timestamp          │
- │       ORDER BY priority DESC, ingested_at DESC              │
- │   ) = 1                                                     │
- └──────────────────────────────┬──────────────────────────────┘
-                                │ Native Schema Cast (UTC Microseconds)
-                                ▼
- ┌─────────────────────────────────────────────────────────────┐
- │              PyIceberg Streaming Commit / Append            │
- │        Direct Iceberg REST Catalog Snapshot Creation        │
- └─────────────────────────────────────────────────────────────┘
+### A. Triệu Chứng (Symptom)
+Khi sử dụng Apache Spark (`INSERT INTO` / `DataFrameWriter`) để ghi hơn 100 triệu dòng dữ liệu lịch sử (2021–2026) vào bảng Iceberg phân vùng theo ngày (`PARTITIONED BY (days(timestamp))`), container `lakehouse-spark-iceberg` (giới hạn 2.5 GB – 4 GB RAM) liên tục bị sập với lỗi:
+```text
+java.lang.OutOfMemoryError: Java heap space
+at org.apache.iceberg.spark.source.SparkWrite$PartitionedFanoutWriter.write(...)
 ```
 
-* **Memory Efficiency**: PyArrow and PyIceberg write Parquet files directly in native C++ memory without touching the JVM garbage collector. Peak RAM stayed consistently below **2.5 GB** across the entire 101M records.
-* **Zero Commit Conflicts**: Sequential symbol-level streaming ensured 100% deterministic snapshot commits to the Iceberg REST catalog without concurrency collisions.
-* **DuckDB Vectorized Speed**: DuckDB executed in-memory filtering and window deduplication on 1.5M rows per symbol in **1.5 to 1.8 seconds**, reaching write speeds between **70,000 and 129,000 rows/second**.
+### B. Phân Tích Nguyên Nhân Gốc Rễ (Root Cause Analysis — Công Thức Toán Học)
+1. Dữ liệu lịch sử trải dài từ `2021-01-01` đến `2026-08` tương ứng với:
+   $$N_{\text{partitions}} \approx 2,058 \text{ phân vùng ngày (UTC days)}$$
+2. Nếu sử dụng `PartitionedFanoutWriter` mà không sắp xếp toàn cục (Global Range Sort), mỗi Spark task mở đồng thời các bộ đệm Parquet (`ParquetRowGroupWriter`, mặc định $B_{\text{row\_group}} = 64\text{ MB}$) cho từng phân vùng ngày xuất hiện trong luồng dữ liệu:
+   $$\text{Memory Pressure}_{\text{Fanout}} = N_{\text{partitions}} \times B_{\text{row\_group}} = 2,058 \times 64\text{ MB} \approx 131.7\text{ GB RAM}$$
+3. Ngay cả khi bật `write.distribution-mode = 'range'`, bước `Exchange rangepartitioning(days(timestamp))` trên 104.7 triệu dòng trong JVM vẫn gây áp lực bộ nhớ đệm (shuffle spill + object serialization overhead) vượt quá ngưỡng Heap cho phép của Docker container trên máy cá nhân.
 
-### Solution 2: Preprocessing Optimization Pipeline
-
-1. **Upfront Quote Currency Scope Pruning (`resolve_preferred_quote_symbols`)**:
-   - Strictly enforces Section 4 of `PROJECT_LAKEHOUSE_MIGRATION_SPEC_FINAL.md`.
-   - Before extracting or processing, filters out non-preferred quotes for Binance (`USDT > USDC > USD > BTC`).
-   - Eliminated over **60% of redundant files** before reading, saving tens of gigabytes of unnecessary I/O.
-2. **PyArrow Multi-threaded Vectorization**:
-   - Replaced single-threaded Pandas row iterations with `pyarrow.dataset` and vectorized compute kernels (`pyarrow.compute`).
-   - Timestamps are converted to microsecond UTC (`timestamp[us, tz=UTC]`) natively in C++.
-3. **Consolidated Monthly Parquet Staging (`YYYY-MM.parquet`)**:
-   - Re-chunked thousands of fragmented raw files into **2,816 consolidated monthly files** under `warehouse/staging/canonical/{exchange}/{canonical_symbol}/`.
-   - Reduced file open/close syscalls by 95%, allowing downstream `raw_to_bronze` to process 101M rows in **780.6 seconds (~13 minutes)**.
-
-### Solution 3: Environment & Memory Management
-* Permanently terminated unnecessary background Thrift services (`HiveThriftServer2`), reclaiming **3.5 GB of host memory**.
-* Configured local Airflow DAG bash operators to directly invoke optimized Python runtime scripts, eliminating unnecessary 15-second JVM cold-start overheads on each DAG task.
+### C. Giải Pháp Kiến Trúc (Zero-JVM-OOM PyIceberg + DuckDB Streaming)
+Loại bỏ hoàn toàn JVM khỏi đường dẫn ETL nặng; chuyển sang kiến trúc **PyIceberg (Native C++ Arrow) + DuckDB In-Process Vectorized Engine**:
+- Sử dụng PyArrow đọc trực tiếp file Parquet theo từng cửa sổ thời gian căn chỉnh với phân vùng (Quý `YYYY-Q1..Q4` cho Bronze, Tháng `YYYY-MM` cho Silver).
+- Giới hạn bộ nhớ DuckDB (`SET memory_limit='1GB'`, `SET threads=4`) và giải phóng vùng nhớ C++ ngay sau mỗi cửa sổ bằng `pa.default_memory_pool().release_unused()`.
 
 ---
 
-## 4. Performance & Throughput Benchmark
+## 2. Post-Mortem #2: Bùng Nổ 84,149 File Nhỏ & Phình Ổ Đĩa Ảo WSL2 (`docker_data.vhdx` 86.35 GB)
 
-| Pipeline Stage | Implementation | Records Processed | Wall Time | Effective Throughput | Peak RAM |
-| :--- | :--- | :---: | :---: | :---: | :---: |
-| **Raw Preprocessing** | PyArrow Multi-threaded | 101,053,358 | ~12 min | ~140,000 rows/s | < 2.0 GB |
-| **Bronze Ingestion** | PyIceberg + PyArrow | 101,053,358 | 780.6 s (~13 min) | **129,460 rows/s** | < 1.2 GB |
-| **Silver Cleansing** | PyIceberg + DuckDB | 100,869,347 | 1,421.2 s (~23 min) | **70,976 rows/s** | < 2.7 GB |
-| **Curated Silver Reconciliation** | PyIceberg + DuckDB | 100,747,585 | 1,415.1 s (~23 min) | **71,193 rows/s** | < 2.7 GB |
-| **Curated Gold Sync** | PyIceberg + DuckDB | 100,650,539 | 1,338.6 s (~22 min) | **75,190 rows/s** | < 2.8 GB |
-| **Data Quality Validation** | PyIceberg + DuckDB | 100,650,539 | 544.8 s (~9 min) | **184,747 rows/s** | < 1.5 GB |
+### A. Triệu Chứng (Symptom)
+1. Ở thiết kế nạp theo từng mã tài sản (vòng lặp ngoài duyệt qua 68 symbols, mỗi symbol gọi `table.append()` cho toàn bộ lịch sử 5 năm), bảng Iceberg sinh ra tới **84,149 file Parquet nhỏ/bảng** (tổng cộng hơn **330,000 file** cả metadata `xl.meta` của MinIO).
+2. File ổ đĩa ảo của Docker Desktop trên Windows (`E:\DockerWSL\docker_data.vhdx`) phình lên tới **86.35 GB**, làm ổ `E:` (100 GB) chỉ còn trống `0.30 GB` và khiến MinIO dừng ghi (`XMinioStorageFull`).
+3. Khi chạy `diskpart -> compact vdisk` lần đầu tiên sau khi xóa dữ liệu cũ, dung lượng file `.vhdx` không giảm một MB nào.
+
+### B. Phân Tích Nguyên Nhân Gốc Rễ (RCA)
+1. **Lệch trục giữa Vòng lặp nạp (Symbol-First) và Khóa phân vùng (Day-First)**:
+   - Bảng Iceberg được phân vùng theo `PARTITIONED BY (days(timestamp))`.
+   - Khi nạp từng symbol một ($S = 68$) qua $D \approx 1,300$ ngày giao dịch, mỗi lần `table.append(symbol_df)` buộc PyIceberg phải tạo 1 file Parquet riêng cho mỗi ngày của symbol đó:
+     $$N_{\text{files}} = \sum_{s=1}^{68} D_s \approx 84,149 \text{ Parquet files/bảng}$$
+   - Trong hệ thống lưu trữ đối tượng MinIO trên `ext4`, mỗi object tạo một thư mục con kèm file `xl.meta` và `part.1` (tối thiểu 2 block 4 KB + inode overhead), nhân gấp 3–4 lần dung lượng đĩa vật lý.
+2. **Tại sao xóa file trong Linux mà `compact vdisk` không giảm dung lượng?**:
+   - Lệnh `rm -rf` trong Linux (`ext4` trên `/dev/sde`) chỉ hủy liên kết inode trong bảng mục lục chứ không ghi số `0` đè lên 61 GB các block dữ liệu cũ.
+   - Nếu không chạy lệnh `fstrim` bên trong Linux VM để phát tín hiệu SCSI `UNMAP / TRIM`, Hyper-V trên Windows vẫn thấy các sector đó chứa bit khác `0` nên không thể thu hồi khi chạy `compact vdisk`.
+
+### C. Giải Pháp & Kết Quả Thực Nghiệm (Before vs. After)
+1. **Đảo trục vòng lặp sang Gom nhóm theo Cửa sổ Thời gian (Partition-Aligned Window Batching)**:
+   - [`raw_to_bronze.py`](../../src/pipeline/bronze/raw_to_bronze.py): Gom toàn bộ 68 symbols theo từng **Quý (`YYYY-Q1..Q4`)** trước khi gọi `table.append()`.
+   - [`bronze_to_silver.py`](../../src/pipeline/silver/bronze_to_silver.py): Quét và khử trùng lặp toàn bộ 68 symbols theo từng **Tháng (`YYYY-MM`)**.
+   - Nhờ đó, mỗi phân vùng ngày UTC chỉ sinh ra đúng **1 file Parquet hợp nhất** chứa đủ 68 symbols!
+2. **Thu hồi dung lượng VHDX bằng `fstrim -a -v` + `compact vdisk`**:
+   - Chạy `docker builder prune -af` + `fstrim -a -v` trên `/dev/sde` trong Linux VM (trim hơn 61 GB block trống), sau đó chạy `wsl --shutdown` và `diskpart -> compact vdisk`.
+
+| Chỉ Số Đo Lường | Trước Tối Ưu (Symbol-by-Symbol) | Sau Tối Ưu (Partition-Aligned Windows) | Mức Cải Thiện |
+| :--- | :--- | :--- | :--- |
+| **Số file Parquet ở `bronze.crypto_bars`** | `84,149` files (`100.65M` dòng) | **`2,071` files** (`104,706,818` dòng) | **Giảm 40.6 lần** |
+| **Số file Parquet ở `silver.bars`** | `84,149` files $\times$ 2 bảng Silver | **`2,058` files** (`104,657,836` dòng, 1 bảng duy nhất) | **Giảm 81.7 lần** |
+| **Tốc độ xử lý `bronze_to_silver.py`** | ~71,000 rows/s (Peak RAM `2.8 GB`) | **`986,372` rows/s** (`106.1s`, Peak RAM `< 800 MB`) | **Nhanh gấp 13.9 lần** |
+| **Thời gian chạy `data_validation.py`** | ~95s (Peak RAM `2.4 GB`) | **`22.7s`** (Quarterly Projection, Peak RAM `< 500 MB`) | **Nhanh gấp 4.2 lần** |
+| **Dung lượng `E:\DockerWSL\docker_data.vhdx`** | **`86.35 GB`** (Ổ `E:` còn `0.30 GB`) | **`39.32 GB`** (Ổ `E:` còn trống **`47.34 GB`**) | **Tiết kiệm 47.03 GB** |
 
 ---
 
-## 5. Architectural Compliance & Guarantees Verified
+## 3. Post-Mortem #3: Khôi Phục 3.65 Triệu Dòng Alpaca Bị Lỗi Lệch Kiểu `int64` vs. `double`
 
-1. **Multi-Exchange Independence**: Alpaca and Binance retain their respective native order book measures and quote currencies (`alpaca:USD`, `alpaca:USDC`, `alpaca:USDT`, `binance:USDT`, `binance:USDC`, `binance:USD`, `binance:TUSD`). They never merge into a single synthetic record.
-2. **Zero Duplicate Keys**: Guaranteed 0 duplicate `(exchange, raw_symbol, timestamp)` keys across all 100.6M records in Curated Gold.
-3. **Market Sanity Enforced**: $high \ge low$, $open > 0$, $close > 0$, $volume \ge 0$, and non-null business keys validated for 100% of final stored records.
-4. **Idempotency & Lineage**: Every run records audit trail metrics in `lakehouse.gold.pipeline_audit` with immutable timestamps and execution batch IDs.
-
----
-
-## 6. Gold Layer Dimensional Modeling (Kimball Architecture)
-
-To resolve the challenge of query performance on BI dashboards (e.g. Power BI, Apache Superset) and implement strict Kimball Dimensional Modeling, the Gold layer is structured into physical dimension and fact tables, rather than relying solely on dynamic SQL views:
-
-```
-                          ┌───────────────────────────┐
-                          │  lakehouse.gold.dim_symbol│
-                          │  (Conformed Dimension)    │
-                          │  - 68 Rows, SCD Type 1    │
-                          └─────────────┬─────────────┘
-                                        │
-           ┌────────────────────────────┼────────────────────────────┐
-           │ 1:N                        │ 1:N                        │ 1:N
-           ▼                            ▼                            ▼
-┌───────────────────────────┐┌───────────────────────────┐┌───────────────────────────┐
-│ gold.curated_crypto_bars  ││gold.agg_daily_crypto_ohlcv││gold.agg_daily_cross_spread│
-│ (Granular 1-Min Fact)     ││(Physical Daily Agg Fact)  ││(Physical Cross-Exch Fact) │
-│ - 100,650,539 Records     ││- 83,761 Records           ││- 30,941 Records           │
-│ - Lowest Granularity      ││- 1,000x Faster for BI     ││- Cross-Exchange Arbitrage │
-└───────────────────────────┘└───────────────────────────┘└───────────────────────────┘
+### A. Triệu Chứng (Symptom)
+Khi chạy `src/preprocessing/alpaca.py` trên 38,677 file Parquet ngày của Alpaca, có **123 tháng** bị báo lỗi và bỏ qua với thông báo:
+```text
+pyarrow.lib.ArrowInvalid: Unable to merge: Field volume has incompatible types: double vs int64
 ```
 
-### Table Breakdown:
-1. **`lakehouse.gold.dim_symbol` (Physical Conformed Dimension Table)**:
-   - Contains 68 distinct symbols with attributes: `symbol_key`, `exchange`, `raw_symbol`, `canonical_symbol`, `base_currency`, `quote_currency`, `asset_class`, `first_trade_date`, `last_trade_date`, `total_bars_recorded`.
-   - Power BI queries this dimension table instantaneously for slice-and-dice filtering.
-2. **`lakehouse.gold.curated_crypto_bars` (Granular 1-Minute Fact Table)**:
-   - 100,650,539 records. Retains the atomic transaction grain for algorithmic trading, backtesting, and ML feature stores.
-3. **`lakehouse.gold.agg_daily_crypto_ohlcv` (Physical Materialized Daily Aggregate Fact Table)**:
-   - 83,761 records. Eliminates the need for Power BI to scan 100M rows on every dashboard load. Pre-calculates `open_price`, `high_price`, `low_price`, `close_price`, `total_volume`, `total_trades`, `minute_bars_count`. Query latency dropped from 130+ seconds to **< 0.3 seconds**.
-4. **`lakehouse.gold.agg_daily_cross_exchange_spread` (Physical Materialized Cross-Exchange Comparison Table)**:
-   - 30,941 records. Pre-joins concurrent Alpaca and Binance trading days, calculating absolute spread and percentage spread directly for cross-exchange analytics.
+### B. Nguyên Nhân Gốc Rễ (RCA)
+Trong dữ liệu thô theo ngày của Alpaca, những ngày tài sản mới niêm yết hoặc có khối lượng bằng `0` nguyên tuyệt đối thì cột `volume` được lưu dưới kiểu `int64`, trong khi các ngày bình thường lưu kiểu `double`. Hàm `pa.concat_tables(tables)` mặc định yêu cầu kiểu dữ liệu khớp tuyệt đối giữa các bảng ngày trong cùng một tháng.
+
+### C. Giải Pháp (Resolution)
+Cập nhật `pa.concat_tables(tables, promote_options="permissive")` trong cả [`src/preprocessing/alpaca.py`](../../src/preprocessing/alpaca.py) và [`src/preprocessing/binance.py`](../../src/preprocessing/binance.py) để PyArrow tự động nâng cấp kiểu `int64 -> double` không mất dữ liệu.
+- **Kết quả**: Khôi phục thành công **123 tháng (`3,653,460` dòng)** của Alpaca, nâng tổng số dòng chuẩn hóa từ `100,650,539` lên **`104,706,818` dòng** với **`0` lỗi**.
 
 ---
 
-## 7. Incremental Hourly Processing Pipeline & ACID Reconciliation
+## 4. Post-Mortem #4: Lỗi Hậu Tố `Z` Trong PyIceberg Trên Python 3.10 & Chuẩn Hóa `raw_symbol` Alpaca Ở Incremental DAG
 
-In addition to full historical backfill, the platform supports real-time scheduled hourly incremental synchronization via Airflow DAG `lakehouse_incremental_hourly`:
+### A. Triệu Chứng (Symptom)
+Khi kiểm thử thực tế DAG [`lakehouse_incremental_hourly`](../../airflow/dags/lakehouse_incremental_hourly_dag.py) trên Airflow:
+1. Task `incremental_reconcile_merge_sync` báo lỗi: `ValueError: Invalid timestamp with zone: 2026-11-08T04:00:00Z (must be ISO-8601)`.
+2. Khi truyền `--alpaca-symbols "BTC/USD,ETH/USD"` vào `rest_fetcher.py`, số lượng symbol trong `silver.bars` tăng từ `68` lên `70`.
 
-```
- ┌─────────────────────────────────────────────────────────────┐
- │ 1. REST API Ingestion (src/incremental/rest_fetcher.py)     │
- │    Fetches latest 1-min bars for Binance & Alpaca           │
- └──────────────────────────────┬──────────────────────────────┘
-                                │ Staged to incremental_{batch_id}.parquet
-                                ▼
- ┌─────────────────────────────────────────────────────────────┐
- │ 2. Target Batch Bronze Ingestion (raw_to_bronze.py)         │
- │    Filters by --batch-id; zero full table scan              │
- └──────────────────────────────┬──────────────────────────────┘
-                                │ Appends 5 to ~4,000 rows
-                                ▼
- ┌─────────────────────────────────────────────────────────────┐
- │ 3. Cleansing & Validation (bronze_to_silver.py)             │
- │    Enforces OHLCV sanity, priority=2, symbol-level filter   │
- └──────────────────────────────┬──────────────────────────────┘
-                                │ Cleansed rows in Silver
-                                ▼
- ┌─────────────────────────────────────────────────────────────┐
- │ 4. Spark Iceberg ACID MERGE (incremental_sync.py)           │
- │    MERGE INTO lakehouse.silver.curated_crypto_bars          │
- │    MERGE INTO lakehouse.gold.curated_crypto_bars            │
- │    ON (exchange, raw_symbol, timestamp)                     │
- │    WHEN MATCHED AND (priority > target.priority ...) UPDATE │
- │    WHEN NOT MATCHED THEN INSERT                             │
- └──────────────────────────────┬──────────────────────────────┘
-                                │ Reconciled Curated Gold
-                                ▼
- ┌─────────────────────────────────────────────────────────────┐
- │ 5. Gold Star Schema Materialization & Refresh               │
- │    Refreshes dim_symbol, agg_daily_crypto_ohlcv, spreads    │
- └─────────────────────────────────────────────────────────────┘
-```
+### B. Nguyên Nhân Gốc Rễ (RCA)
+1. Container `lakehouse-spark-iceberg` sử dụng Python 3.10. Hàm `datetime.fromisoformat()` của Python 3.10 (được PyIceberg gọi nội bộ khi biên dịch biểu thức lọc `TimestamptzType`) chỉ chấp nhận định dạng múi giờ `+00:00` chứ chưa hỗ trợ hậu tố chữ `Z` (chỉ có từ Python 3.11+).
+2. Trong `alpaca.py`, `raw_symbol` của Alpaca được lấy từ tên thư mục `symbol=BTC_USD` (dùng dấu gạch dưới `_`), trong khi API REST của Alpaca nhận tham số `BTC/USD`. Nếu `rest_fetcher.py` lưu nguyên `"BTC/USD"` vào cột `raw_symbol`, khóa chính `(exchange, raw_symbol, timestamp)` sẽ coi `BTC/USD` và `BTC_USD` là 2 mã khác nhau.
 
-### Verified Incremental Performance:
-* **Batch Filtering**: By passing `--batch-id`, Bronze and Silver processing took **< 5 seconds total**, completely bypassing the 100M historical records.
-* **ACID Upsert Speed**: Spark Iceberg `MERGE INTO` executed the intra-exchange priority reconciliation in **~8.2 seconds** with zero JVM heap pressure (as hourly records fall into 1 or 2 partition dates).
-* **Data Quality Verification**: Full post-sync check passed with **0 duplicate keys**, **0 sanity violations**, and audit record logged to `gold.pipeline_audit`.
+### C. Giải Pháp (Resolution)
+1. Bổ sung hàm chuẩn hóa `_normalize_pyiceberg_ts()` trong [`incremental_sync.py`](../../src/pipeline/incremental/incremental_sync.py) và [`publish_confirmed_parquet.py`](../../src/pipeline/incremental/publish_confirmed_parquet.py) để tự động chuyển hậu tố `Z` thành `+00:00` (cho bảng `TimestamptzType`) hoặc chuỗi naive (cho bảng `TimestampType`).
+2. Chuẩn hóa `canonical_raw_sym = clean_raw_symbol(sym).replace("/", "_")` trong [`rest_fetcher.py`](../../src/pipeline/incremental/rest_fetcher.py) để mọi bản ghi REST của Alpaca luôn mang `raw_symbol` dạng `BTC_USD`, `ETH_USD` đồng nhất 100% với 68 symbols gốc.
 
 ---
 
-## 8. Financial Domain Considerations: Quote Currency Peg Risk & Arbitrage Alerting
+## 5. Phân Tích Rủi Ro Tỷ Giá Stablecoin (De-Peg Risk) & Chuẩn Hóa Tại Tầng Serving
 
-### A. The Core Financial Problem: Fiat USD vs Stablecoin USDT Peg Discrepancy
-* **Domain Reality**: In cryptocurrency markets, **USD (Fiat - US Central Bank money)** on Alpaca and **USDT (Tether Stablecoin)** or **USDC (Circle)** on Binance are distinct currencies with independent risk profiles:
-  - While $1\text{ USDT} \approx 1\text{ USD}$ under normal conditions, USDT is subject to peg risk (de-peg events historically reached $\$0.95$ to $\$1.03$).
-  - Comparing raw exchange prices across distinct quote currencies (e.g. `BTC/USD` on Alpaca vs `BTCUSDT` on Binance) without currency normalization introduces **Phantom Arbitrage Spreads** (False Positive alerts).
-  - *Example*: If BTC true value is identical on both exchanges, but USDT de-pegs to $\$0.98$, Binance `BTCUSDT` will trade at $\$102,040$ while Alpaca `BTC/USD` trades at $\$100,000$. A naive cross-exchange spread calculation yields a $2.04\%$ arbitrage signal, which is entirely attributable to stablecoin de-peg, not exchange liquidity divergence.
+### A. Vấn Đề Nghiệp Vụ Tài Chính
+- Alpaca yết giá bằng `USD` (tiền pháp định), trong khi Binance yết giá chủ đạo bằng `USDT` hoặc `USDC` (Stablecoin).
+- Nếu giả định cứng $1\text{ USDT} = 1\text{ USD}$, trong các sự kiện biến động thị trường (ví dụ `USDC` de-peg về `0.88 USD` vào tháng 03/2023 hoặc `USDT` lệch về `0.985 USD`), chênh lệch giá tính theo công thức thô $\text{Close}_{\text{Alpaca}} - \text{Close}_{\text{Binance}}$ sẽ báo hiệu cơ hội Arbitrage giả mạo.
 
-### B. Architectural Principle: Preservation of Historical Truth in Base Tables
-* **No Artificial In-flight Conversion in Bronze/Silver/Gold**:
-  - The Lakehouse strictly stores native transaction records (`alpaca:USD`, `binance:USDT`, `binance:USDC`).
-  - Forcing an immediate currency conversion during ingestion would corrupt the audit trail and destroy historical integrity.
-
-### C. Solution for Serving & Alerting (Phase 2 Roadmap)
-1. **Exchange Rate Reference Dimension Table (`dim_fiat_stablecoin_rates`)**:
-   - Ingest continuous exchange rate feeds for `USDT/USD` and `USDC/USD` (via Binance stablecoin market pairs already present in the catalog, such as `USDT-USD`, `USDC-USD`, or Chainlink Decentralized Oracle feeds).
-2. **Normalized Cross-Exchange Spread Calculation (Serving Layer)**:
-   $$\text{Binance Close (USD Equivalent)} = \text{Close}_{\text{Binance (USDT)}} \times \text{Rate}_{\text{USDT/USD}}$$
-   $$\text{Real Arbitrage Spread} = \text{Close}_{\text{Alpaca (USD)}} - \text{Binance Close (USD Equivalent)}$$
----
-
-## 9. Architecture Audit Post-Mortem & Invariants Hardening (October 2026)
-
-### A. Executive Summary
-A comprehensive peer review revealed that while the conceptual design (Business Key, Multi-Exchange Independence, Quote Currency Preservation) was sound, the initial implementation contained four critical non-invariant gaps. These gaps have been resolved to achieve 100% production-grade compliance.
-
-### B. Findings, Root Causes & Resolutions
-
-#### 1. Partition Specification Drift in DDL
-* **Symptom**: `sql/ddl/01_create_iceberg_tables.sql` contained `PARTITIONED BY (exchange, days(timestamp))`.
-* **Root Cause**: Early prototype DDL included `exchange` in the partition spec, violating Invariant 4 (`days(timestamp)` only) and causing 2x partition small-file fragmentation.
-* **Resolution**: Updated DDL and migrated Iceberg catalog partition specs across all Medallion tiers (`bronze`, `silver`, `curated_silver`, `gold`) to strictly `PARTITIONED BY (days(timestamp))`.
-* **Prevention**: Added contract test `test_ddl_partition_specs_strict_days_only` verifying that `exchange` never appears in the DDL partition transform.
-
-#### 2. Non-Idempotent Historical Ingestion Appends
-* **Symptom**: Re-running `silver_to_curated_silver.py`, `curated_silver_to_gold.py`, or `materialize_gold_aggregates.py` performed blind `.append()`, doubling row counts.
-* **Root Cause**: Ingestion scripts were originally tuned for a clean initial load, lacking replay/reconcile branches.
-* **Resolution**: Refactored PyIceberg ingestion paths to inspect target tables for existing symbols. If existing records are detected, the pipeline automatically executes an atomic `target_tbl.overwrite(reconciled_arr, overwrite_filter=sym_filter)` instead of `.append()`. For aggregates, `t_daily` overwrites by symbol and `t_spread` atomically overwrites the table.
-* **Prevention**: Added contract test `test_idempotent_deduplication_replay` proving that duplicate re-runs yield identical row counts.
-
-#### 3. Incomplete OHLCV Mathematical Consistency Checks
-* **Symptom**: SQL filtering in `bronze_to_silver.py` and `data_validation.py` only validated `high >= low`, omitting boundary checks against open and close prices.
-* **Root Cause**: SQL predicates were simplified during initial drafting.
-* **Resolution**: Standardized on a centralized 7-condition predicate:
-  $$\text{open} > 0 \land \text{high} > 0 \land \text{low} > 0 \land \text{close} > 0 \land \text{volume} \ge 0$$
-  $$\text{high} \ge \text{low} \land \text{high} \ge \text{open} \land \text{high} \ge \text{close} \land \text{low} \le \text{open} \land \text{low} \le \text{close}$$
-  Exported as `OHLCV_SANITY_SQL_PREDICATE` and `OHLCV_VIOLATION_SQL_PREDICATE` in `src/preprocessing/normalizer.py`.
-* **Prevention**: Added contract test `test_ohlcv_all_seven_sanity_rules` testing all invalid boundary conditions.
-
-#### 4. Unbounded Full-Table Self-Joins in Analytical Serving Views
-* **Symptom**: Querying `v_cross_exchange_comparison` or `v_cross_exchange_normalized_spread` without a `WHERE timestamp` clause triggered full-table self-joins on 100M rows, exhausting executor threads.
-* **Root Cause**: Analytical views directly joined base 1-minute fact tables without materialized aggregate shortcuts or partition pruning guards.
-* **Resolution**:
-  - Pointed `v_daily_crypto_ohlcv` and `v_cross_exchange_daily_spread` to pre-materialized tables (`agg_daily_crypto_ohlcv`, `agg_daily_cross_exchange_spread`) for sub-second serving.
-  - Created `v_daily_cross_exchange_normalized_spread` joining daily aggregates with stablecoin reference rates.
-  - Added query guards and partition pruning warnings to minute-level views.
-
----
-
-## 10. Architecture Review 2: Senior DE Production Hardening (7/7 Findings Resolved)
-
-A second comprehensive peer review identified 7 architectural gaps required to transition from a functioning benchmark to a 100% production-grade data platform. All 7 findings have been implemented, tested, and validated:
-
-### 1. DDL Migration & Partition Spec Evolution Engine
-* **Symptom**: `CREATE TABLE IF NOT EXISTS` leaves existing Iceberg tables untouched, so previously created tables retain old partition specs.
-* **Resolution**: Created `src/utils/verify_and_migrate_catalog.py` which dynamically inspects partition specs across all tables via PyIceberg REST API and automatically evolves violating partition specs (e.g. removes obsolete `exchange` partition transforms). Added runbook `docs/4-runbooks/catalog-partition-migration.md`. Wired into Airflow DAG `lakehouse_historical_backfill` under task `init_iceberg_tables`.
-
-### 2. Idempotent Dimension Materializer for `gold.dim_symbol`
-* **Symptom**: `gold.dim_symbol` existed in DDL and was queried by `rest_fetcher.py`, but lacked an automated materialization job.
-* **Resolution**: Built `src/spark/gold/materialize_dim_symbol.py`. Derives conformed SCD Type 1 dimensions (`exchange`, `raw_symbol`, `canonical_symbol`, `first_trade_date`, `last_trade_date`, `total_bars_recorded`) directly from table truth with stable surrogate keys (`symbol_key`). Overwrites `gold.dim_symbol` atomically. Also integrated directly into `materialize_gold_aggregates.py`.
-
-### 3. Serving Layer Guard: Elimination of Unguarded Minute-Level Views
-* **Symptom**: Comment guards in SQL views cannot enforce `WHERE` predicates; running `SELECT * FROM v_cross_exchange_minute_spread LIMIT 10` executes an unpartitioned 100M-row self-join.
-* **Resolution**: Dropped unguarded minute-level self-join views from `sql/ddl/02_create_gold_views.sql`. Public serving layer now strictly exposes pre-materialized aggregates (`v_daily_crypto_ohlcv`, `v_hourly_crypto_ohlcv`, `v_cross_exchange_daily_spread`, `v_daily_cross_exchange_normalized_spread`). Implemented `src/serving/query_minute_spread.py` which strictly enforces mandatory `[start_time, end_time]` parameters and rejects windows $> 7$ days, executing pushdown partition filtering on both sides before joining in-process.
-
-### 4. Integration Test for Live Iceberg Atomic Overwrite
-* **Symptom**: Previous tests only validated DuckDB windowing logic, not actual PyIceberg `.overwrite(..., overwrite_filter=...)` behavior.
-* **Resolution**: Implemented `tests/test_iceberg_idempotency.py`. Connects to live Iceberg REST catalog and MinIO, creates temporary partitioned Iceberg tables, tests initial append vs. multiple replay overwrites, verifies row count invariance ($N = 3$), validates in-place value updates, and asserts that symbol-scoped overwrites leave other symbols untouched.
-
-### 5. Idempotent Silver Writes & Checkpoint Protection
-* **Symptom**: Silver layer was appending blindly, causing storage and metadata bloat on pipeline replays.
-* **Resolution**: Updated `src/spark/silver/bronze_to_silver.py` with scoped check-and-overwrite (`target_tbl.overwrite(clean_arr, overwrite_filter=sym_filter)`). Replaying the Silver layer now leaves row counts strictly invariant.
-
-### 6. Symbol Discovery from Catalog Truth
-* **Symptom**: `data_validation.py` and `materialize_gold_aggregates.py` discovered symbols by inspecting local staging parquet files on disk. If staging was cleaned or mismatched with Gold, validation missed corrupt data.
-* **Resolution**: Refactored `discover_symbols_from_catalog()` in both `data_validation.py` and `materialize_gold_aggregates.py`. Discovers active symbols directly from `gold.dim_symbol` or `gold.curated_crypto_bars` metadata scans, eliminating disk coupling.
-
-### 7. Source Ingestion Manifest Table (`bronze.source_manifest`)
-* **Symptom**: Absence of checkpointing table to record which raw source files or symbol batches have been ingested, their hashes, row counts, and status.
-* **Resolution**: Added `lakehouse.bronze.source_manifest` to DDL (partitioned by `days(processed_at)`). Implemented `src/utils/manifest_tracker.py` computing SHA-256 hashes, tracking status (`INGESTED_BRONZE`, `PROCESSED_SILVER`), min/max timestamps, and row counts for every processed file. Integrated into `raw_to_bronze.py` and `bronze_to_silver.py`.
-
----
-
-## 11. Architecture Review 3: 100% Senior DE Production Closure (Final 5 Reviewer Items)
-
-A third and final review audited edge cases in dimension derivation, manifest gating, and testing portability. All 5 findings were fully addressed and verified:
-
-### 1. Authentic Dimension Mappings (Zero Synthetic Guessing)
-* **Symptom**: `materialize_dim_symbol.py` fallback path constructed `raw_symbol` using string concatenation (`base_currency || '_' || quote_currency`), which produced incorrect keys for exchanges like Alpaca whose native tickers use slashes (e.g. `BTC/USD` rather than `BTC_USD`).
-* **Root Cause**: The aggregate table `agg_daily_crypto_ohlcv` omitted `raw_symbol` to optimize grouping storage, leading the fallback logic to synthesize tickers.
-* **Resolution**: Refactored `load_true_raw_mappings()` in `src/spark/gold/materialize_dim_symbol.py` to extract true `raw_symbol` mappings strictly from authoritative truth (`gold.curated_crypto_bars` or staging parquet footers directly via PyArrow schema scan in $< 0.2$s). Removed all synthetic concatenation logic. Overwrites `gold.dim_symbol` atomically in $2.7$ seconds.
-
-### 2. Granular SHA-256 Manifest Idempotency Gate in Bronze Ingestion
-* **Symptom**: `raw_to_bronze.py` appended staging files on pipeline replays without checking `source_manifest`, and batch hashing only inspected `parquet_files[0]`.
-* **Root Cause**: The ingestion loop lacked a per-file gate to consult the manifest prior to PyIceberg appends.
-* **Resolution**: Updated `src/utils/manifest_tracker.py` and `src/spark/bronze/raw_to_bronze.py` to compute individual SHA-256 content hashes for every staging file. Before reading, `is_file_already_ingested(exchange, file_path, file_hash)` checks the manifest; if the hash already exists, the file is cleanly skipped. A `--force-replay` flag was added for deliberate backfill overrides.
-
-### 3. File-Level Audit Trail in `bronze.source_manifest`
-* **Symptom**: Multi-file symbol batches recorded only directory-level summaries, obscuring individual file provenance.
-* **Resolution**: `record_file_ingestion()` now logs individual records per file with exact file path, SHA-256 hash, byte size, row count, min/max timestamp boundaries, and ingestion status (`INGESTED_BRONZE`), providing a complete audit trail.
-
-### 4. Live Serving Layer Integration Test (`query_minute_spread.py`)
-* **Symptom**: Contract tests only validated input validation (rejecting windows $> 7$ days), leaving live partition pushdown filtering and DuckDB join logic unverified against real Iceberg tables.
-* **Resolution**: Added `test_query_minute_spread_happy_path_live()` to `tests/test_iceberg_idempotency.py`. Executes a live 1-day query for BTC (`2026-08-10T00:00:00Z` to `2026-08-11T00:00:00Z`), verifies that partition pushdown filters are properly applied to both Alpaca and Binance tables, and asserts non-empty, schema-compliant spread output.
-
-### 5. Multi-Environment Test Portability
-* **Symptom**: Executing `python -m unittest discover tests` on host environments without `pyiceberg` failed with `ModuleNotFoundError`.
-* **Resolution**: Wrapped `pyiceberg` imports in try/except blocks across test suites with `@unittest.skipUnless(HAS_PYICEBERG, ...)`. The test suite runs cleanly in any environment: 18/18 tests execute and PASS inside the Docker Spark container, while host environments pass all unit/contract tests with 4 live-catalog tests cleanly skipped.
-
-
-
-
-
+### B. Giải Pháp Toán Học Tại Tầng Phục Vụ (`phase2-cloud-setup-spec.md` & `query_minute_spread.py`)
+1. Giữ nguyên đơn vị tiền tệ gốc trong `bronze.crypto_bars` và `silver.bars`.
+2. Trích xuất chuỗi tỷ giá thực tế `USDT-USD` và `USDC-USD` qua View `v_fiat_stablecoin_rates`.
+3. Chuẩn hóa giá Binance về `USD` tại thời điểm truy vấn:
+   $$P_{\text{Binance, USD}}(t) = P_{\text{Binance, USDT}}(t) \times R_{\text{USDT/USD}}(t)$$
+   $$\text{Normalized Spread}_{\text{USD}}(t) = P_{\text{Alpaca, USD}}(t) - P_{\text{Binance, USD}}(t)$$

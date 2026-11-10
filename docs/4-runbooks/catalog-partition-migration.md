@@ -1,67 +1,51 @@
-# Runbook: Iceberg Catalog Partition Spec Verification & Migration
+# Runbook: Kiểm Tra & Tiến Hóa Phân Vùng Iceberg Catalog (`verify_and_migrate_catalog.py`)
 
-## 1. Mục đích & Bối cảnh
-Theo **Lakehouse Invariant 01** (`.agent/rules/01-lakehouse-invariants.md`), các bảng fact 1-minute trong Lakehouse:
-- **BẮT BUỘC** phân vùng theo thời gian: `PARTITIONED BY (days(timestamp))` (hoặc `days(trade_date)` / `days(created_at)` / `days(processed_at)`).
-- **TUYỆT ĐỐI CẤM** phân vùng theo `exchange` hoặc `raw_symbol`.
+## 1. Mục Đích & Bối Cảnh
+Theo quy chuẩn bất biến của Lakehouse ([`.agent/rules/01-lakehouse-invariants.md`](../../.agent/rules/01-lakehouse-invariants.md)), tất cả các bảng dữ liệu nến 1 phút trên hệ thống:
+- **BẮT BUỘC** phân vùng theo ngày: `PARTITIONED BY (days(timestamp))` (hoặc `days(trade_date)`, `days(processed_at)`, `days(created_at)` cho các bảng tổng hợp và vận hành).
+- **TUYỆT ĐỐI CẤM** phân vùng theo `exchange`, `raw_symbol` hoặc `canonical_symbol` (nhằm ngăn chặn thảm họa bùng nổ hàng trăm nghìn file nhỏ).
 
-Tuy nhiên, trong Apache Iceberg, lệnh `CREATE TABLE IF NOT EXISTS` **không làm thay đổi** partition spec của các bảng đã tồn tại trong catalog trước đó. Nếu môi trường đã tạo bảng cũ chứa `PARTITIONED BY (days(timestamp), exchange)`, việc sửa file DDL `.sql` là chưa đủ để cập nhật catalog.
-
-Runbook này cung cấp quy trình và công cụ tự động để kiểm tra, phát hiện và evolve partition spec trực tiếp trên Iceberg Catalog mà không cần xóa dữ liệu.
+Trong Apache Iceberg, lệnh `CREATE TABLE IF NOT EXISTS` **không tự động sửa lại** cấu trúc phân vùng (Partition Spec) của các bảng đã tồn tại từ trước. Do đó, dự án trang bị công cụ tự động [`src/utils/verify_and_migrate_catalog.py`](../../src/utils/verify_and_migrate_catalog.py) để kiểm toán và tiến hóa phân vùng (In-place Partition Evolution) trực tiếp trên REST Catalog.
 
 ---
 
-## 2. Invariant Partition Spec Ma trận chuẩn
+## 2. Ma Trận Phân Vùng Chuẩn Trên Toàn Hệ Thống
 
-| Tầng / Bảng | Partition Transform Chuẩn | Cấm Phân Vùng Theo |
-| :--- | :--- | :--- |
-| `lakehouse.bronze.crypto_bars` | `days(timestamp)` | `exchange`, `raw_symbol` |
-| `lakehouse.bronze.source_manifest` | `days(processed_at)` | `exchange`, `raw_symbol` |
-| `lakehouse.silver.crypto_bars` | `days(timestamp)` | `exchange`, `raw_symbol` |
-| `lakehouse.silver.curated_crypto_bars` | `days(timestamp)` | `exchange`, `raw_symbol` |
-| `lakehouse.gold.curated_crypto_bars` | `days(timestamp)` | `exchange`, `raw_symbol` |
-| `lakehouse.gold.agg_daily_crypto_ohlcv` | `days(trade_date)` hoặc unpartitioned | `exchange`, `canonical_symbol` |
-| `lakehouse.gold.agg_daily_cross_exchange_spread` | `days(trade_date)` hoặc unpartitioned | `exchange`, `base_currency` |
-| `lakehouse.gold.dim_symbol` | Unpartitioned (SCD Type 1 Dimension) | `exchange`, `raw_symbol` |
-| `lakehouse.gold.pipeline_audit` | `days(created_at)` | `dag_id`, `status` |
+| Môi Trường | Namespace / Bảng | Partition Spec Chuẩn | Trường Cấm Phân Vùng |
+| :--- | :--- | :--- | :--- |
+| **Local & Cloud Control Plane** | `lakehouse.ops.ingestion_manifest` | `days(processed_at)` | `exchange`, `raw_symbol` |
+| **Local & Cloud Control Plane** | `lakehouse.ops.pipeline_audit` | `days(created_at)` | `dag_id`, `status` |
+| **Local Data Plane** | `lakehouse.bronze.crypto_bars` | `days(timestamp)` | `exchange`, `raw_symbol` |
+| **Local & Cloud Data Plane** | `lakehouse.silver.bars` | `days(timestamp)` | `exchange`, `raw_symbol` |
+| **Cloud Data Plane** | `lakehouse.bronze.rt_bars` | `days(timestamp)` | `exchange`, `raw_symbol` |
+| **Cloud Data Plane (Gold)** | `lakehouse.gold.agg_daily_crypto_ohlcv` | `days(trade_date)` | `exchange`, `canonical_symbol` |
+| **Cloud Data Plane (Gold)** | `lakehouse.gold.agg_daily_cross_exchange_spread` | `days(trade_date)` | `exchange`, `base_currency` |
+| **Cloud Data Plane (Gold)** | `lakehouse.gold.dim_symbol` | Unpartitioned (SCD Type 1) | `exchange`, `raw_symbol` |
+| **Cloud Data Plane (Gold)** | `lakehouse.gold.dim_date` | Unpartitioned | `year`, `month` |
 
 ---
 
-## 3. Công cụ kiểm tra & Migrate tự động
+## 3. Lệnh Thực Thi Kiểm Toán & Tiến Hóa Tự Động
 
-Script: [`src/utils/verify_and_migrate_catalog.py`](file:///e:/project_hybrid_lakehouse_crypto/src/utils/verify_and_migrate_catalog.py)
-
-### 3.1. Chạy trên Docker Container (Khuyến nghị)
+### 3.1. Chạy Kiểm Tra & Tự Động Sửa Partition Spec
 ```bash
-docker exec -w /home/iceberg lakehouse-spark-iceberg python src/utils/verify_and_migrate_catalog.py
+docker exec -w /home/iceberg lakehouse-spark-iceberg python3 src/utils/verify_and_migrate_catalog.py
 ```
 
-### 3.2. Chế độ kiểm tra chỉ đọc (Dry Run / No Evolve)
+### 3.2. Chế Độ Chỉ Kiểm Tra (Dry Run / Không Sửa Đổi)
 ```bash
-docker exec -w /home/iceberg lakehouse-spark-iceberg python src/utils/verify_and_migrate_catalog.py --no-evolve
+docker exec -w /home/iceberg lakehouse-spark-iceberg python3 src/utils/verify_and_migrate_catalog.py --no-evolve
 ```
 
 ---
 
-## 4. Cơ chế hoạt động của Script
-1. Kết nối vào REST Catalog (`http://rest:8181`).
-2. Tải metadata của từng bảng và kiểm tra danh sách partition fields trong spec hiện hành.
-3. Nếu phát hiện trường cấm (ví dụ `exchange`), script tự động gọi PyIceberg Partition Evolution API:
+## 4. Cơ Chế Hoạt Động
+1. Kết nối tới Iceberg REST Catalog (`http://iceberg-rest:8181`) trên bucket `s3://lakehouse/`.
+2. Quét metadata của toàn bộ các bảng trong `ops`, `bronze`, `silver` (và `gold` khi chạy trên Cloud).
+3. Nếu phát hiện bất kỳ trường phân vùng bị cấm nào (ví dụ `exchange` hoặc `raw_symbol`), công cụ tự động gọi API Partition Evolution của PyIceberg:
    ```python
-   update = table.update_spec()
-   update.remove_field("exchange")
-   update.commit()
+   with table.update_spec() as update:
+       update.remove_field(field.name)
    ```
-4. Xác nhận lại spec mới và trả về mã exit code:
-   - `0`: Tất cả các bảng 100% tuân thủ invariant.
-   - `1`: Có bảng lỗi hoặc không thể evolve.
-
----
-
-## 5. Tích hợp trong Pipeline & Airflow
-Task `init_iceberg_tables` trong DAG `lakehouse_historical_backfill` đã được xâu chuỗi:
-```bash
-spark-sql -f /home/iceberg/sql/ddl/01_create_iceberg_tables.sql
-python3 /home/iceberg/src/utils/verify_and_migrate_catalog.py
-```
-Điều này đảm bảo rằng mỗi khi pipeline khởi chạy, catalog luôn được kiểm tra và chuẩn hóa tự động trước khi bước nạp dữ liệu bắt đầu.
+4. Trả về mã thoát `0` khi 100% bảng tuân thủ chuẩn phân vùng, hoặc `1` nếu có lỗi cần can thiệp.
+5. Công cụ này được tích hợp tự động vào Task `init_iceberg_tables` trong DAG [`airflow/dags/lakehouse_historical_backfill_dag.py`](../../airflow/dags/lakehouse_historical_backfill_dag.py).

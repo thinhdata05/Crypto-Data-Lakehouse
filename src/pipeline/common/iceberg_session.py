@@ -5,8 +5,33 @@ SparkSession factory configured with Apache Iceberg REST Catalog and MinIO S3Fil
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Any, Optional
 from pyspark.sql import SparkSession
+
+
+def get_catalog() -> Any:
+    """
+    Returns a configured PyIceberg REST Catalog instance pointing to s3://lakehouse/.
+    """
+    from pyiceberg.catalog import load_catalog
+
+    rest_uri = os.getenv("ICEBERG_REST_URI", "http://iceberg-rest:8181")
+    s3_endpoint = os.getenv("MINIO_ENDPOINT", "http://minio:9000")
+    s3_access_key = os.getenv("AWS_ACCESS_KEY_ID", "admin")
+    s3_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY", "password")
+    catalog_name = os.getenv("ICEBERG_CATALOG_NAME", "lakehouse")
+
+    return load_catalog(
+        catalog_name,
+        **{
+            "type": "rest",
+            "uri": rest_uri,
+            "s3.endpoint": s3_endpoint,
+            "s3.access-key-id": s3_access_key,
+            "s3.secret-access-key": s3_secret_key,
+            "s3.path-style-access": "true",
+        },
+    )
 
 
 def get_spark_session(
@@ -21,7 +46,7 @@ def get_spark_session(
     s3_access_key = os.getenv("AWS_ACCESS_KEY_ID", "admin")
     s3_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY", "password")
     catalog_name = os.getenv("ICEBERG_CATALOG_NAME", "lakehouse")
-    warehouse_path = os.getenv("ICEBERG_WAREHOUSE", "s3://warehouse/")
+    warehouse_path = os.getenv("ICEBERG_WAREHOUSE", "s3://lakehouse/")
 
     builder = (
         SparkSession.builder.appName(app_name)

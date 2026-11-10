@@ -5,7 +5,7 @@ Enforces Lakehouse Invariant 01:
 - Partitioning MUST strictly be days(timestamp) (or days(trade_date) / days(created_at) / days(processed_at)).
 - NEVER partition by exchange or raw_symbol.
 - Automatically checks live Iceberg catalog tables, evolves obsolete partition specs,
-  and verifies conformity across Bronze, Silver, Curated Silver, and Gold.
+  and verifies conformity across Control Plane (`ops.*`) and Data Plane (`bronze.*`, `silver.*`, `gold.*`).
 """
 
 from __future__ import annotations
@@ -19,46 +19,27 @@ from pyiceberg.catalog import load_catalog
 from pyiceberg.exceptions import NoSuchTableError
 
 
-# Invariant Table Rules:
-# tableName -> (expected_fields, forbidden_fields)
-TABLE_PARTITION_INVARIANTS = {
+# Core Local Lakehouse Tables (required on Local s3://lakehouse/):
+REQUIRED_LOCAL_TABLES = {
+    "ops.ingestion_manifest": {
+        "allowed_specs": [["processed_at_day"]],
+        "forbidden_fields": ["exchange", "raw_symbol"],
+    },
+    "ops.pipeline_audit": {
+        "allowed_specs": [["created_at_day"]],
+        "forbidden_fields": ["dag_id", "status"],
+    },
     "bronze.crypto_bars": {
         "allowed_specs": [["timestamp_day"]],
         "forbidden_fields": ["exchange", "raw_symbol"],
     },
-    "bronze.source_manifest": {
-        "allowed_specs": [["processed_at_day"]],
-        "forbidden_fields": ["exchange", "raw_symbol"],
-    },
-    "silver.crypto_bars": {
+    "silver.bars": {
         "allowed_specs": [["timestamp_day"]],
         "forbidden_fields": ["exchange", "raw_symbol"],
-    },
-    "silver.curated_crypto_bars": {
-        "allowed_specs": [["timestamp_day"]],
-        "forbidden_fields": ["exchange", "raw_symbol"],
-    },
-    "gold.curated_crypto_bars": {
-        "allowed_specs": [["timestamp_day"]],
-        "forbidden_fields": ["exchange", "raw_symbol"],
-    },
-    "gold.agg_daily_crypto_ohlcv": {
-        "allowed_specs": [["trade_date_day"], []],
-        "forbidden_fields": ["exchange", "canonical_symbol"],
-    },
-    "gold.agg_daily_cross_exchange_spread": {
-        "allowed_specs": [["trade_date_day"], []],
-        "forbidden_fields": ["exchange", "base_currency"],
-    },
-    "gold.dim_symbol": {
-        "allowed_specs": [[]],
-        "forbidden_fields": ["exchange", "raw_symbol"],
-    },
-    "gold.pipeline_audit": {
-        "allowed_specs": [["created_at_day"]],
-        "forbidden_fields": ["dag_id", "status"],
     },
 }
+
+TABLE_PARTITION_INVARIANTS = dict(REQUIRED_LOCAL_TABLES)
 
 
 def get_catalog():
@@ -89,6 +70,7 @@ def verify_and_migrate(auto_evolve: bool = True) -> bool:
     print("=" * 90)
 
     for table_name, rules in TABLE_PARTITION_INVARIANTS.items():
+        is_required = table_name in REQUIRED_LOCAL_TABLES
         try:
             tbl = catalog.load_table(table_name)
             current_spec = tbl.spec()
@@ -106,7 +88,6 @@ def verify_and_migrate(auto_evolve: bool = True) -> bool:
                         for f in forbidden_present:
                             update.remove_field(f)
                         update.commit()
-                        # Re-read
                         tbl = catalog.load_table(table_name)
                         spec_fields = [f.name for f in tbl.spec().fields]
                         status = "EVOLVED"
@@ -120,15 +101,17 @@ def verify_and_migrate(auto_evolve: bool = True) -> bool:
                     note = f"Contains forbidden fields {forbidden_present}"
                     all_passed = False
             elif spec_fields not in rules["allowed_specs"]:
-                # Non-critical warning if spec is valid but different
                 status = "WARN"
                 note = f"Spec fields {spec_fields} not in standard {rules['allowed_specs']}"
 
             results.append((table_name, status, note))
 
         except NoSuchTableError:
-            results.append((table_name, "MISSING", "Table does not exist in catalog"))
-            all_passed = False
+            if is_required:
+                results.append((table_name, "MISSING", "Required table does not exist in catalog"))
+                all_passed = False
+            else:
+                results.append((table_name, "SKIP", "Cloud-only table (not initialized on Local Producer)"))
         except Exception as e:
             results.append((table_name, "ERROR", str(e)))
             all_passed = False
@@ -136,14 +119,14 @@ def verify_and_migrate(auto_evolve: bool = True) -> bool:
     print(f"{'Table Name':<38} | {'Status':<8} | {'Details'}")
     print("-" * 90)
     for tname, status, note in results:
-        indicator = "✅" if status in ("PASS", "EVOLVED") else ("⚠️" if status == "WARN" else "❌")
+        indicator = "✅" if status in ("PASS", "EVOLVED", "SKIP") else ("⚠️" if status == "WARN" else "❌")
         print(f"{tname:<38} | {indicator} {status:<6} | {note}")
     print("-" * 90)
 
     if all_passed:
         print("[SUCCESS] All Iceberg catalog tables strictly satisfy Lakehouse Invariant 01!")
     else:
-        print("[FAILURE] One or more tables violate partition invariants or are missing.")
+        print("[FAILURE] One or more required tables violate partition invariants or are missing.")
 
     return all_passed
 

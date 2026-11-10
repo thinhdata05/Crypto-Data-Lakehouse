@@ -42,13 +42,13 @@ from src.preprocessing.normalizer import (
 def get_default_paths() -> tuple[str, str]:
     if os.path.exists("/home/iceberg/raw"):
         raw_root = "/home/iceberg/raw/alpaca/bars"
-        staging_root = "/home/iceberg/warehouse_local/staging/canonical"
+        staging_root = "/home/iceberg/staging_local/canonical"
     else:
         raw_root = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "../../raw/alpaca/bars")
         )
         staging_root = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "../../warehouse/staging/canonical")
+            os.path.join(os.path.dirname(__file__), "../../staging/canonical")
         )
     return raw_root, staging_root
 
@@ -100,7 +100,7 @@ def process_alpaca_month(
         if not tables:
             return len(file_paths), 0, None
 
-        concat_table = pa.concat_tables(tables)
+        concat_table = pa.concat_tables(tables, promote_options="permissive")
         df = concat_table.to_pandas()
         if df.empty:
             return len(file_paths), 0, None

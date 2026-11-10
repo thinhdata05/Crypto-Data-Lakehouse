@@ -25,6 +25,7 @@ airflow_logs/
 # Data / Lakehouse Storage
 # =========================
 raw/
+staging/
 warehouse/
 *.parquet
 tmp/

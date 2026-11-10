@@ -89,7 +89,7 @@ def query_minute_spread(
         )
 
     cat = catalog or get_catalog()
-    gold_tbl = cat.load_table("gold.curated_crypto_bars")
+    gold_tbl = cat.load_table("silver.bars")
 
     base_curr = base_currency.upper().strip()
 

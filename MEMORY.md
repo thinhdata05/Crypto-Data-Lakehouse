@@ -1,138 +1,86 @@
 # PROJECT MEMORY: Multi-Exchange Crypto Lakehouse Platform
 
-## 1. Project Identity & Status
-- **Project**: Multi-Exchange Crypto Lakehouse Platform (Apache Iceberg, Spark, MinIO, DuckDB, PyIceberg, Airflow)
-- **Current Phase**: **Phase 1 Complete (Authoritative Core & Historical Ingestion)**
-- **Total Records in Gold**: **100,650,539 bars** (100% verified, 0 duplicate keys, 0 OHLCV sanity violations)
-- **Covered Exchanges**: **Alpaca** (34 symbols, quote `USD`) & **Binance** (34 symbols, quote `USDT` / `USDC` / `USD`)
-- **Conformed Canonical Symbols**: 34 high-liquidity crypto assets (`BTC`, `ETH`, `SOL`, `ADA`, `AVAX`, `DOGE`, etc.)
-- **Status of Services**: All 6 Docker containers (`lakehouse-minio`, `lakehouse-iceberg-rest`, `lakehouse-spark-iceberg`, `lakehouse-postgres`, `lakehouse-airflow-webserver`, `lakehouse-airflow-scheduler`) healthy on network `lakehouse-net`.
+## 1. Project Identity & Current Verified Status
+- **Platform**: Multi-Exchange Crypto Lakehouse Platform (Apache Iceberg, PyIceberg, DuckDB, Spark SQL, MinIO, Airflow)
+- **Current Phase**: **Phase 1 & Phase 2 Local Producer Complete (Textbook Senior DE Architecture)**
+- **Physical Storage Bucket**: `s3://lakehouse/` (MinIO S3-compatible object storage)
+- **Verified Local Lakehouse Metrics (`run_id = 28c4df2d-6b52-4c3e-9721-065a0fdd5f79` & Incremental DAG `056d4b65-cc90-4b89-99fb-166f24d3dd22`)**:
+  - `lakehouse.bronze.crypto_bars`: **`104,706,818` historical bars** (+ incremental REST bars) across **`2,071`** coalesced daily Parquet files (`0` preprocessing errors; permissive schema promotion recovered 123 Alpaca months / `3,653,460` rows).
+  - `lakehouse.silver.bars`: **`104,657,836` historical bars** (+ incremental reconciled bars) across **`2,058`** coalesced daily Parquet files (`48,982` invalid/duplicate bars filtered out; `0` duplicate keys, `0` OHLCV sanity violations).
+  - `lakehouse.ops.ingestion_manifest`: **`3,007` SHA-256 lineage entries** (`2,939` monthly file hashes + `68` symbol-level batch summaries + incremental file hashes).
+  - `lakehouse.ops.pipeline_audit`: Execution telemetry across `raw_to_bronze`, `bronze_to_silver`, `incremental_sync`, and `data_validation`.
+- **Covered Universe**: **68 market symbols** (**34 Alpaca** in `USD`/`USDT`/`USDC` + **34 Binance** in `USDT`/`USDC`/`USD`/`TUSD`).
+- **Automated Test & DAG Verification**:
+  - **25/25 Unit & Live Integration Tests**: `PASS` in `~3.0s` (`python3 -m unittest discover -s tests -v`), covering partition invariants, multi-exchange independence, OHLCV sanity (including trade_count >= 0), atomic manifest generation, S3 upload verification, and live single-writer convergence.
+  - **Airflow Incremental Hourly DAG (`lakehouse_incremental_hourly`)**: `SUCCESS` end-to-end across all tasks in `~34s` (`rest_fetcher` -> `raw_to_bronze` -> `incremental_sync` -> `publish_confirmed_parquet` -> `data_validation`). Local stops cleanly at handoff.
+- **Phase 2 Cloud Architectural Decoupling**:
+  - The Local repository is strictly a **Lightweight Producer** (Local Data Plane stops at `lakehouse.silver.bars` $\to$ publishes confirmed Parquet slices + `_manifest.json` to handoff directory/S3 bucket).
+  - All Phase 2 Cloud components (Dual-Exchange Realtime WebSocket Ingestion, Cloud Single-Writer Convergence Worker, Cloud Iceberg `silver.bars`, and `lakehouse.gold.*`) are decoupled external AWS services specified in `docs/3-specifications/phase2-cloud-setup-spec.md`. The Local codebase contains zero Cloud execution code or Gold tables.
+- **Authoritative Gold Views**:
+  - Exactly **7 views** specified in `docs/3-specifications/phase2-cloud-setup-spec.md` (`v_daily_crypto_ohlcv`, `v_hourly_crypto_ohlcv`, `v_cross_exchange_daily_spread`, `v_cross_exchange_comparison`, `v_pipeline_audit_summary`, `v_fiat_stablecoin_rates`, `v_daily_cross_exchange_normalized_spread`). Local maintains zero Gold tables or views.
+- **Benchmark Realism**:
+  - Historical backfill throughput (~986k rows/s) and RAM usage (< 800 MB) are empirical single-run benchmarks on 104M+ rows using DuckDB streaming windows on local developer hardware, not guaranteed platform SLAs.
+  - File coalescing achieves 1 file per partition day per batch window; continuous incremental micro-batches produce separate files until Iceberg table compaction is executed.
+- **Infrastructure & Disk Footprint**:
+  - All 6 Docker containers (`lakehouse-minio`, `lakehouse-iceberg-rest`, `lakehouse-spark-iceberg`, `lakehouse-postgres`, `lakehouse-airflow-webserver`, `lakehouse-airflow-scheduler`) healthy on `lakehouse-net`.
+  - WSL2 virtual disk `E:\DockerWSL\docker_data.vhdx` compacted via `fstrim -a -v` + `diskpart compact vdisk` from `86.35 GB` down to **`39.32 GB`** (`47.34 GB` free space on drive `E:`).
 
 ---
 
-## 2. Directory & Documentation Index
-
-### Core Documentation Tree (`docs/`)
-- [`README.md`](README.md): Tổng quan kiến trúc, pipeline, bảng dữ liệu, và lệnh khởi động nhanh.
-- [`docs/1-architecture/storage-and-warehouse.md`](docs/1-architecture/storage-and-warehouse.md):
-  - Phân định rõ ràng: MinIO Object Storage (`s3://warehouse/`) là nơi lưu trữ Iceberg data & metadata.
-  - Thư mục local `warehouse/` chỉ là scratch / staging tạm thời (`warehouse/staging/canonical`).
-- [`docs/2-postmortems-and-tuning/root-cause-and-benchmarks.md`](docs/2-postmortems-and-tuning/root-cause-and-benchmarks.md):
-  - RCA lỗi Spark OOM `PartitionedFanoutWriter` (1,584 partition days x 64MB = 101GB memory pressure).
-  - Kiến trúc Hybrid PyIceberg + DuckDB streaming (giảm RAM < 2.8GB, tốc độ 71k - 129k rows/s).
-  - Phân tích rủi ro de-peg Stablecoin (USDT vs USDC vs USD) và giải pháp serving view chuẩn hóa.
-- [`docs/3-specifications/phase1-migration-spec.md`](docs/3-specifications/phase1-migration-spec.md):
-  - Bản đặc tả kỹ thuật chi tiết của toàn bộ hệ thống Phase 1.
-- [`docs/4-runbooks/operations-and-maintenance.md`](docs/4-runbooks/operations-and-maintenance.md):
-  - Sổ tay vận hành: Khởi động container, chạy Airflow DAGs, Spark SQL CLI, compaction & snapshot expiration.
-- [`docs/5-data-contracts/symbol-and-currency-contract.md`](docs/5-data-contracts/symbol-and-currency-contract.md):
-  - Data contracts: Quy ước đặt tên symbol, thứ tự ưu tiên Quote Currency, và các ràng buộc Invariants.
+## 2. Documentation Index & Language Convention
+- **Agent Operational Files (Written in English)**:
+  - [`AGENTS.md`](file:///e:/project_hybrid_lakehouse_crypto/AGENTS.md): Entry-point instructions for AI Agents.
+  - [`MEMORY.md`](file:///e:/project_hybrid_lakehouse_crypto/MEMORY.md): Authoritative system state, metrics, and architectural decisions.
+  - [`.agent/rules/01-lakehouse-invariants.md`](file:///e:/project_hybrid_lakehouse_crypto/.agent/rules/01-lakehouse-invariants.md): Core invariants, business key, priority resolution, partitioning, and Hybrid Cloud Option 1.
+  - [`.agent/rules/02-financial-domain-rules.md`](file:///e:/project_hybrid_lakehouse_crypto/.agent/rules/02-financial-domain-rules.md): Quote currency preservation, stablecoin peg normalization, and 7-rule OHLCV sanity.
+  - [`.agent/rules/03-safety-and-devops.md`](file:///e:/project_hybrid_lakehouse_crypto/.agent/rules/03-safety-and-devops.md): Container execution, partition pushdown, Python 3.10 timestamp rules, and VHDX disk hygiene.
+  - [`.agent/rules/04-documentation-rules.md`](file:///e:/project_hybrid_lakehouse_crypto/.agent/rules/04-documentation-rules.md): Auto-documentation reflex and language rules.
+- **Human Documentation Files (Written in Vietnamese)**:
+  - [`README.md`](file:///e:/project_hybrid_lakehouse_crypto/README.md): Project overview, architecture, pipeline flows, and quickstart commands.
+  - [`docs/1-architecture/storage-and-warehouse.md`](file:///e:/project_hybrid_lakehouse_crypto/docs/1-architecture/storage-and-warehouse.md): Deep dive into `s3://lakehouse/`, Control Plane (`ops.*`) vs. Data Plane (`bronze.*`, `silver.bars`, `gold.*`), and Phase 2 Hybrid Cloud Option 1.
+  - [`docs/2-postmortems-and-tuning/root-cause-and-benchmarks.md`](file:///e:/project_hybrid_lakehouse_crypto/docs/2-postmortems-and-tuning/root-cause-and-benchmarks.md): Post-mortems (Spark JVM OOM, 84k small files & VHDX bloat, Alpaca permissive schema promotion, Python 3.10 ISO-8601 `Z` handling) and quantitative benchmarks.
+  - [`docs/3-specifications/phase1-migration-spec.md`](file:///e:/project_hybrid_lakehouse_crypto/docs/3-specifications/phase1-migration-spec.md): Complete technical specification of the Local Medallion Producer (`ops`, `bronze`, `silver.bars`).
+  - [`docs/3-specifications/phase2-cloud-setup-spec.md`](file:///e:/project_hybrid_lakehouse_crypto/docs/3-specifications/phase2-cloud-setup-spec.md): Cloud Single-Writer Convergence specification (`bronze.rt_bars`, `silver.bars`, `gold.*`, Dual WebSocket Alpaca + Binance).
+  - [`docs/4-runbooks/catalog-partition-migration.md`](file:///e:/project_hybrid_lakehouse_crypto/docs/4-runbooks/catalog-partition-migration.md): Runbook for automated Iceberg partition spec verification and evolution.
+  - [`docs/4-runbooks/operations-and-maintenance.md`](file:///e:/project_hybrid_lakehouse_crypto/docs/4-runbooks/operations-and-maintenance.md): Runbook for Docker operations, CLI backfill vs. Airflow incremental scheduling, snapshot expiration, and VHDX compaction.
+  - [`docs/5-data-contracts/symbol-and-currency-contract.md`](file:///e:/project_hybrid_lakehouse_crypto/docs/5-data-contracts/symbol-and-currency-contract.md): Data contracts, 68-symbol universe, Hasbrouck Information Share & Granger causality proofs, and `confirmed/` manifest contract.
 
 ---
 
 ## 3. Core Architectural Invariants (DO NOT VIOLATE)
-
-1. **Multi-Exchange Independence**:
-   - Alpaca và Binance có sổ lệnh (order book) và cơ chế khớp lệnh độc lập.
-   - Dữ liệu cùng `timestamp` và cùng `canonical_symbol` (ví dụ `BTC` lúc `2024-09-04 12:00:00 UTC` trên Alpaca và Binance) là **2 thực thể riêng biệt**, KHÔNG ĐƯỢC gộp hay ghi đè lên nhau.
-2. **Expanded Business Key**:
-   - Khóa định danh hợp nhất duy nhất trên toàn hệ thống: `(exchange, raw_symbol, timestamp)`.
-3. **Intra-Exchange Priority Resolution**:
-   - Cơ chế giải quyết xung đột ưu tiên (`priority`: 3 = Backfill sửa lỗi > 2 = REST API Hourly > 1 = Realtime Websocket) **CHỈ áp dụng nội bộ trong cùng 1 exchange**.
-4. **No Synthetic / Artificial Rows**:
-   - Dữ liệu lịch sử của mỗi symbol bắt đầu chính xác từ thời điểm niêm yết thực tế trên sàn đó ($\ge 2021-01-01$ UTC).
-   - Tuyệt đối không sinh dòng giả (forward-fill / dummy records) cho các mốc thời gian trước khi niêm yết.
-5. **Quote Currency Preservation in Base Storage**:
-   - Bảng cơ sở (Bronze, Silver, Curated Silver, Gold) lưu trữ đúng giá trị nguyên bản theo đồng yết giá (`quote_currency`: Alpaca là `USD`, Binance là `USDT`/`USDC`).
-   - Tuyệt đối **không tự ý nhân tỷ giá để đổi `USDT` thành `USD`** trong bảng gốc nhằm bảo toàn tính toàn vẹn kiểm toán (auditability).
-   - Mọi quy đổi chuẩn hóa tỷ giá chỉ được thực hiện ở tầng phục vụ phân tích (Serving Layer View: `gold.v_cross_exchange_normalized_spread`).
-6. **Iceberg Partitioning Spec**:
-   - Tất cả các bảng `crypto_bars` đều phân vùng theo `days(timestamp)`. Không phân vùng theo symbol để tránh bùng nổ small files.
-
----
-
-## 4. Current Lakehouse State & Metrics
-
-### Physical Storage & Tables
-- **Iceberg Warehouse**: `s3://warehouse/` (MinIO: `http://localhost:9000`, bucket: `warehouse`).
-  - `lakehouse.bronze.crypto_bars`: 100,650,539 rows (Append-only).
-  - `lakehouse.silver.crypto_bars`: 100,650,539 rows (Sanity validated, priority attached).
-  - `lakehouse.silver.curated_crypto_bars`: 100,650,539 rows (Deduplicated by business key & priority).
-  - `lakehouse.gold.curated_crypto_bars`: 100,650,539 rows (Authoritative gold dataset).
-  - `lakehouse.gold.dim_symbol`: 68 symbol mappings (34 Alpaca + 34 Binance).
-  - `lakehouse.gold.agg_daily_crypto_ohlcv`: Daily aggregations per exchange.
-  - `lakehouse.gold.agg_daily_cross_exchange_spread`: Daily cross-exchange basis & spread.
-  - `lakehouse.gold.pipeline_audit`: Tracking batch metrics, row counts, validation results.
-- **Serving Analytical Views** (Được định nghĩa trong `sql/ddl/02_create_gold_views.sql`):
-  1. `v_active_crypto_symbols`
-  2. `v_daily_market_summary`
-  3. `v_cross_exchange_daily_spread`
-  4. `v_latest_symbol_prices`
-  5. `v_fiat_stablecoin_rates` (Trích xuất tỷ giá USDT-USD, USDC-USD phục vụ quy đổi)
-  6. `v_cross_exchange_normalized_spread` (Chuẩn hóa giá Binance về USD để tính arbitrage spread không bị méo mó bởi peg)
-
-### Maintained Artifacts
-- Các bảng benchmark kiểm thử lưu trong `warehouse/bronze/`: `test_spark_clustered` và `test_spark_range` (Được giữ nguyên để phục vụ tra cứu benchmark).
+1. **Business Key**: `(exchange, raw_symbol, timestamp)`.
+   - Alpaca `raw_symbol` uses underscores (`BTC_USD`, `ETH_USD`); Binance uses concatenated pairs (`BTCUSDT`, `ETHUSDT`).
+2. **Multi-Exchange Independence**:
+   - Alpaca and Binance bars at the same timestamp are independent market observations and must never overwrite each other.
+3. **Intra-Exchange Priority Resolution ($3 > 2 > 1$)**:
+   - `3`: WebSocket late correction (`T='u'`, `source='correction'`).
+   - `2`: Historical Backfill & Hourly Incremental REST API (`source='historical'`), tie-broken by `ingested_at DESC`.
+   - `1`: Preliminary WebSocket bar (`T='b'`, `source='realtime'`).
+   - Enforced **strictly within the same `exchange`**.
+4. **Control Plane vs. Data Plane Separation**:
+   - `lakehouse.ops.ingestion_manifest` (`PARTITIONED BY (days(processed_at))`): Per-file SHA-256 lineage and idempotency checkpointing.
+   - `lakehouse.ops.pipeline_audit` (`PARTITIONED BY (days(created_at))`): Pipeline execution telemetry.
+   - `lakehouse.bronze.crypto_bars` (`PARTITIONED BY (days(timestamp))`): Immutable append-only canonical bars on Local.
+   - `lakehouse.silver.bars` (`PARTITIONED BY (days(timestamp))`): Single authoritative Silver table on both Local and Cloud (7-rule OHLCV sanity, dynamic priority $3 > 2 > 1$, deduplicated).
+5. **Phase 2 Hybrid Architecture (Option 1 — Local Lightweight Producer)**:
+   - Local stops at `lakehouse.silver.bars` (no Local `gold.*` tables, eliminating Split-Brain risk) and exports hourly immutable Parquet slices + `_manifest.json` to `confirmed/`.
+   - **Proposed Cloud Architecture (Target Design)**: Cloud will ingest Dual WebSocket streams (`WS Alpaca + WS Binance`) into `lakehouse.bronze.rt_bars`, merge `bronze.rt_bars` + `confirmed/` via a Single Writer into Cloud `lakehouse.silver.bars`, and materialize the sole **`lakehouse.gold.*`** layer (`dim_symbol`, `dim_date`, `agg_daily_crypto_ohlcv`, `agg_daily_cross_exchange_spread`, and views specified in `docs/3-specifications/phase2-cloud-setup-spec.md`).
 
 ---
 
-## 5. Phase 2 Roadmap & Next Objectives
-
-1. **Hybrid Cloud Extension**:
-   - Đồng bộ hóa dữ liệu từ MinIO local lên AWS S3 (Hybrid Lakehouse).
-   - Tích hợp streaming ingestion qua Apache Kafka / AWS MSK.
-2. **Dual-Speed Gold Serving**:
-   - Phân tách kiến trúc phục vụ: Realtime Gold (sub-second streaming via Redis/DuckDB/ClickHouse) vs Curated Gold (batch authoritative via Iceberg).
-3. **Cross-Exchange Arbitrage & ML Feature Store**:
-   - Xây dựng pipeline phát hiện cơ hội Arbitrage theo thời gian thực (dựa trên `v_cross_exchange_normalized_spread`).
-   - Xây dựng Feature Store tính toán các chỉ báo kỹ thuật (RSI, Bollinger Bands, Volume Weighted Average Price - VWAP) phục vụ mô hình định lượng.
-
----
-
-## 6. Git Clone Readiness & Secret Governance
-- **Bảo mật API & Biến môi trường**:
-  - File `.env` chứa mật khẩu thực tế được bảo vệ tuyệt đối bằng `.gitignore` (không bị lộ lên GitHub).
-  - File `.env.example` cung cấp đầy đủ các biến mẫu, bao gồm `APCA_API_KEY_ID` và `APCA_API_SECRET_KEY` (cho Alpaca).
-  - Binance REST API là public endpoint, chạy trực tiếp mà không cần API key.
-- **Tính khả chuyển (Portability)**:
-  - Loại bỏ hoàn toàn các đường dẫn tuyệt đối dạng `E:\...` trong mã nguồn Python (`alpaca.py`, `binance.py`). Hệ thống tự động phân giải đường dẫn tương đối qua `__file__`.
-  - Mọi câu lệnh trong `README.md` sử dụng đường dẫn Linux nội bộ container (`/home/iceberg/...`) hoặc `./` tại host.
-- **Tài liệu song ngữ đơn file**:
-  - `README.md` áp dụng cơ chế thẻ `<details open>` cho Tiếng Việt và `<details>` cho Tiếng Anh, cho phép người dùng chuyển đổi ngôn ngữ mượt mà trong cùng một file duy nhất.
-
----
-
-## 7. Production Hardening & Invariants Hardening (Reviewer Audit Complete)
-- **Chuẩn hóa Partition Spec DDL**: Bỏ hoàn toàn `exchange` trong phân vùng; toàn bộ 4 bảng facts 1 phút đồng bộ chuẩn `PARTITIONED BY (days(timestamp))`.
-- **Idempotent Replay cho Historical & Aggregates**:
-  - `silver_to_curated_silver.py` và `curated_silver_to_gold.py`: Tự động nhận diện dữ liệu hiện hữu và áp dụng `target_tbl.overwrite(..., overwrite_filter=sym_filter)` thay vì blind append. Chạy lại nhiều lần vẫn giữ nguyên số dòng, 0 duplicate.
-  - `materialize_gold_aggregates.py`: Ghi đè có phân vùng theo symbol cho `agg_daily_crypto_ohlcv` và ghi đè nguyên tử bảng `agg_daily_cross_exchange_spread`.
-- **Kiểm tra OHLCV Sanity đủ 7 điều kiện**:
-  - Đã chuẩn hóa vị ngữ SQL `OHLCV_SANITY_SQL_PREDICATE` bổ sung `high >= open`, `high >= close`, `low <= open`, `low <= close`, áp dụng đồng nhất cho `bronze_to_silver.py` và `data_validation.py`.
-- **Bảo vệ Serving Layer Cross-Exchange**:
-  - Trỏ các view phục vụ chính (`v_daily_crypto_ohlcv`, `v_cross_exchange_daily_spread`, `v_daily_cross_exchange_normalized_spread`) vào các bảng Aggregate được tính sẵn để trả kết quả tức thì (< 1s).
-  - View chi tiết theo phút `v_cross_exchange_minute_spread` và `v_cross_exchange_normalized_spread` có cảnh báo bắt buộc lọc partition `WHERE timestamp BETWEEN ...`.
-- **Bổ sung Data Contract Tests**: Đạt **17/17 Unit & Contract Tests** (pass 100% cả trên host lẫn trong container Spark).
-
----
-
-## 8. Senior DE Production Hardening (Reviewer Round 2 - 7/7 Findings Resolved)
-- **1. Catalog Partition Migration & Verification Engine**: Tạo `src/utils/verify_and_migrate_catalog.py` tự động quét Iceberg REST Catalog, phát hiện và evolve bỏ trường cấm (`exchange`) trong partition spec của các bảng cũ. Tích hợp trực tiếp vào DAG Airflow `lakehouse_historical_backfill` (task `init_iceberg_tables`) và viết runbook tại `docs/4-runbooks/catalog-partition-migration.md`.
-- **2. Idempotent Dimension Materializer (`gold.dim_symbol`)**: Tạo `src/spark/gold/materialize_dim_symbol.py` tính toán SCD Type 1 conformed dimensions (`first_trade_date`, `last_trade_date`, `total_bars_recorded`, surrogate key `symbol_key`) từ bảng Gold authoritative và ghi đè nguyên tử `gold.dim_symbol`. Tự động gọi mỗi khi chạy `materialize_gold_aggregates.py`.
-- **3. Khóa an toàn Serving Layer**: Bỏ hoàn toàn các view tự join cấp phút không có guard (`v_cross_exchange_minute_spread`, `v_cross_exchange_normalized_spread`) khỏi `02_create_gold_views.sql` để triệt tiêu nguy cơ OOM/Cartesian scan trên 100M dòng. Cung cấp API phục vụ an toàn `src/serving/query_minute_spread.py` bắt buộc có `[start_time, end_time]`, từ chối truy vấn quá 7 ngày, áp dụng pushdown partition filter trước khi join.
-- **4. Integration Test PyIceberg Overwrite Thật**: Tạo `tests/test_iceberg_idempotency.py` kết nối trực tiếp REST Catalog & MinIO, tạo bảng Iceberg tạm, test replay nhiều lần chứng minh số dòng bất biến ($N=3$), test cập nhật giá in-place và bảo toàn symbol khác khi overwrite cục bộ.
-- **5. Silver Idempotent Write**: Cập nhật `bronze_to_silver.py` cơ chế check-and-overwrite theo symbol scope (`target_tbl.overwrite(..., overwrite_filter=sym_filter)`). Replay Silver nhiều lần không còn phình dữ liệu hay sinh duplicate metadata.
-- **6. Table-Truth Symbol Discovery**: Chuyển đổi `discover_symbols_from_catalog()` trong `data_validation.py` và `materialize_gold_aggregates.py` sang đọc metadata từ `gold.dim_symbol` hoặc `gold.curated_crypto_bars`, xóa bỏ hoàn toàn phụ thuộc vào thư mục staging local.
-- **7. Source Ingestion Manifest & Checkpointing**: Thêm bảng `lakehouse.bronze.source_manifest` (partition theo `days(processed_at)`), xây dựng `src/utils/manifest_tracker.py` tính hash SHA-256 theo dõi file đã ingest, min/max timestamp, số dòng và trạng thái (`INGESTED_BRONZE`, `PROCESSED_SILVER`). Tích hợp vào `raw_to_bronze.py` và `bronze_to_silver.py`.
-
----
-
-## 9. 100% Senior DE Production Closure (Reviewer Round 3 - Final 5 Findings Resolved)
-- **1. Authentic Dimension Mappings (Zero Synthetic Guessing)**: Cập nhật `src/spark/gold/materialize_dim_symbol.py` hàm `load_true_raw_mappings()` đọc trực tiếp ánh xạ `raw_symbol` từ `gold.curated_crypto_bars` hoặc schema footers của parquet files trong $< 0.2$s, xóa bỏ hoàn toàn chuỗi suy đoán `base_currency || '_' || quote_currency` (tránh sai lệch ký hiệu như Alpaca `BTC/USD`).
-- **2. Per-File SHA-256 Manifest Idempotency Gate**: Nâng cấp `src/spark/bronze/raw_to_bronze.py` và `src/utils/manifest_tracker.py` tính mã băm SHA-256 cho từng file parquet riêng biệt và kiểm tra `is_file_already_ingested(..., file_hash)`. Bỏ qua toàn bộ file đã từng nạp trên các lần chạy lặp lại, hỗ trợ cờ `--force-replay` khi cần ghi đè có chủ đích.
-- **3. File-Level Granular Audit Trail**: Bảng `lakehouse.bronze.source_manifest` ghi nhận từng file với đầy đủ đường dẫn, mã SHA-256, dung lượng bytes, số dòng, min/max timestamp và trạng thái `INGESTED_BRONZE`.
-- **4. Live Serving Layer Integration Test (`query_minute_spread.py`)**: Bổ sung `test_query_minute_spread_happy_path_live()` vào `tests/test_iceberg_idempotency.py` kiểm thử truy vấn 1 ngày thực tế (`BTC`), xác nhận pushdown partition filter trên cả Alpaca và Binance fact tables và kiểm tra schema output.
-- **5. Multi-Environment Test Portability**: Bọc an toàn `pyiceberg` imports bằng decorator `@unittest.skipUnless(HAS_PYICEBERG, ...)`. Đạt **18/18 tests PASS** tuyệt đối bên trong container Spark, đồng thời chạy mượt mà trên môi trường host (14 tests pass, 4 skip an toàn).
-
-
-
+## 4. End-to-End Pipeline Flow & Design Rationale
+1. **Stage 1 — Pre-Bronze Coalescing & Schema Standardization (`src/preprocessing/alpaca.py`, `src/preprocessing/binance.py`)**:
+   - Reads `87,693` raw daily Parquet files (`./raw/alpaca/bars` and `./raw/binance/bars`).
+   - Prunes non-primary quote currencies (`Binance: USDT > USDC > USD > BTC`, `Alpaca: USD > USDT > USDC`) to retain 68 canonical symbols.
+   - Resolves `int64` vs. `double` `volume` schema drift across daily files via `pa.concat_tables(tables, promote_options="permissive")` and coalesces daily files into `2,939` monthly Parquet files in `./staging/canonical/`.
+2. **Stage 2 — Partition-Aligned Bronze Ingestion (`src/pipeline/bronze/raw_to_bronze.py`)**:
+   - Verifies per-file SHA-256 hashes against `lakehouse.ops.ingestion_manifest` to skip already-ingested files.
+   - Batches all 68 symbols by **Quarter (`YYYY-Q1..Q4`)** before appending to `lakehouse.bronze.crypto_bars` (`s3://lakehouse/bronze/crypto_bars`), coalescing writes into **`2,071` daily Parquet files** (`104,706,818` rows) instead of `84,149` small files.
+3. **Stage 3 — Partition-Aligned Silver Transformation (`src/pipeline/silver/bronze_to_silver.py`)**:
+   - Streams `lakehouse.bronze.crypto_bars` by **Calendar Month (`YYYY-MM`)** across all 68 symbols (`Peak RAM < 800 MB`, `986,372` rows/s).
+   - Applies in-process DuckDB vectorization to filter out 7-rule OHLCV violations, assign dynamic `priority` ($3 > 2 > 1$), and deduplicate on `(exchange, raw_symbol, timestamp)` ordered by `priority DESC, ingested_at DESC`.
+   - Writes **`104,657,836` rows** (`48,982` invalid/duplicate bars removed) into **`2,058` daily Parquet files** in `lakehouse.silver.bars`.
+4. **Stage 4 — Hourly Incremental Producer (`airflow/dags/lakehouse_incremental_hourly_dag.py`)**:
+   - `rest_fetcher.py` $\to$ `raw_to_bronze.py` $\to$ `incremental_sync.py` (scoped daily partition overwrite in `silver.bars`) $\to$ `publish_confirmed_parquet.py` (writes per-exchange Parquet + `_manifest.json` to `staging/confirmed/`) $\to$ `data_validation.py`.
+5. **Stage 5 — Partition-Aligned Quality Audit (`src/pipeline/quality/data_validation.py`)**:
+   - Validates `silver.bars` in quarterly windows with column projection (`Peak RAM < 500 MB`, `22.7s` runtime) and logs `SUCCESS` to `lakehouse.ops.pipeline_audit`.

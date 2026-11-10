@@ -62,6 +62,27 @@ class TestIcebergIdempotencyIntegration(unittest.TestCase):
         cls.catalog = get_test_catalog()
         cls.table_name = "silver.test_idempotent_replay_contract"
 
+    def _purge_table_clean(self, table_name: str):
+        if not HAS_PYICEBERG or not self.catalog:
+            return
+        try:
+            self.catalog.purge_table(table_name)
+        except Exception:
+            try:
+                self.catalog.drop_table(table_name)
+            except Exception:
+                pass
+        try:
+            import pyarrow.fs as pafs
+            s3 = pafs.S3FileSystem(
+                endpoint_override=os.getenv("MINIO_ENDPOINT", "http://minio:9000"),
+                access_key=os.getenv("AWS_ACCESS_KEY_ID", "admin"),
+                secret_key=os.getenv("AWS_SECRET_ACCESS_KEY", "password"),
+            )
+            s3.delete_dir(f"lakehouse/{table_name.replace('.', '/')}")
+        except Exception:
+            pass
+
     def setUp(self):
         if not HAS_PYICEBERG:
             self.skipTest(
@@ -71,17 +92,10 @@ class TestIcebergIdempotencyIntegration(unittest.TestCase):
         if not self.catalog:
             self.skipTest("Iceberg REST catalog is not accessible in current environment.")
         # Ensure clean state
-        try:
-            self.catalog.drop_table(self.table_name)
-        except Exception:
-            pass
+        self._purge_table_clean(self.table_name)
 
     def tearDown(self):
-        if HAS_PYICEBERG and self.catalog:
-            try:
-                self.catalog.drop_table(self.table_name)
-            except Exception:
-                pass
+        self._purge_table_clean(self.table_name)
 
     def _create_temp_table(self):
         schema = Schema(
@@ -204,17 +218,21 @@ class TestIcebergIdempotencyIntegration(unittest.TestCase):
     def test_query_minute_spread_happy_path_live(self):
         """
         Happy-Path Test: Verifies query_minute_spread() retrieves and aligns
-        minute bars for a valid 1-day window against live Iceberg curated gold tables,
+        minute bars for a valid 1-day window against live Iceberg curated tables
+        (gold.curated_crypto_bars or silver.curated_crypto_bars under Option 1),
         confirming that ISO string timestamp pushdown filtering works accurately.
         """
         from src.serving.query_minute_spread import query_minute_spread
 
+        has_curated_data = False
         try:
-            gold_tbl = self.catalog.load_table("gold.curated_crypto_bars")
-            if not gold_tbl.current_snapshot():
-                self.skipTest("gold.curated_crypto_bars has no snapshot")
+            tbl = self.catalog.load_table("silver.bars")
+            if tbl.current_snapshot():
+                has_curated_data = True
         except Exception:
-            self.skipTest("Cannot connect to gold.curated_crypto_bars")
+            pass
+        if not has_curated_data:
+            self.skipTest("silver.bars does not have a snapshot yet")
 
         # Query 1-day interval
         start_time = "2026-08-10T00:00:00Z"

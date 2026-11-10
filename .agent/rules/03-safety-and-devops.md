@@ -1,66 +1,67 @@
 ---
-description: Docker container execution protocols, JVM thread protection, MinIO storage guardrails, and pipeline idempotency
-globs: ["docker/**", "docker-compose.yml", "airflow/**", "config/**", "scripts/**", "sql/**"]
+description: Docker container execution protocols, JVM thread protection, MinIO storage guardrails, VHDX disk management, and pipeline idempotency
+globs: "docker/**, docker-compose.yml, airflow/**, config/**, src/**, sql/**"
 ---
 
 # 03. Safety, DevOps & Execution Guardrails
 
-Quy chuẩn an toàn khi thực thi lệnh hệ thống, bảo vệ tài nguyên Docker/JVM, quản lý lưu trữ MinIO và bảo đảm tính lũy kế (idempotency).
+Operational safety standards for Docker container execution, memory/disk protection, MinIO `s3://lakehouse/` storage governance, and idempotent pipeline replay.
 
 ---
 
-## 1. Containerized Execution Environment (Môi trường thực thi Docker)
-- Tất cả các thao tác tương tác với Apache Spark, Iceberg REST Catalog, Airflow và MinIO phải được thực hiện thông qua Docker containers trên mạng nội bộ `lakehouse-net`:
-  - **Spark SQL**:
+## 1. Containerized Execution Environment
+- All interactions with Apache Spark, Iceberg REST Catalog, Airflow, and MinIO run inside Docker containers on `lakehouse-net`:
+  - **Spark SQL CLI (DDL execution)**:
     ```bash
-    docker exec -i lakehouse-spark-iceberg spark-sql -f /opt/spark/work-dir/<sql_file>
+    docker exec -w /home/iceberg lakehouse-spark-iceberg spark-sql -f /home/iceberg/sql/ddl/01_create_iceberg_tables.sql
     ```
-  - **Spark Submit**:
+  - **Zero-JVM PyIceberg + DuckDB Pipelines**:
     ```bash
-    docker exec -it lakehouse-spark-iceberg spark-submit --master local[*] <script.py>
+    docker exec -w /home/iceberg lakehouse-spark-iceberg python3 src/pipeline/bronze/raw_to_bronze.py --batch-id <uuid>
+    docker exec -w /home/iceberg lakehouse-spark-iceberg python3 src/pipeline/silver/bronze_to_silver.py --batch-id <uuid> --target-table silver.bars
+    docker exec -w /home/iceberg lakehouse-spark-iceberg python3 src/pipeline/quality/data_validation.py --run-id <uuid> --target-table silver.bars
     ```
   - **Airflow CLI**:
     ```bash
-    docker exec -it lakehouse-airflow-webserver airflow dags trigger <dag_id>
-    docker exec -it lakehouse-airflow-webserver airflow tasks state <dag_id> <task_id> <execution_date>
+    docker exec lakehouse-airflow-scheduler airflow dags test lakehouse_incremental_hourly 2026-11-08T07:00:00Z
     ```
-- **Quy tắc an toàn**: Tuyệt đối không thay đổi cấu hình mạng Docker `lakehouse-net` hoặc kill container đột ngột khi đang diễn ra tác vụ ghi dữ liệu vào Iceberg.
 
 ---
 
-## 2. JVM Thread Pool & Memory Protection (Bảo vệ Spark trên 100M+ dòng)
-- Bảng `gold.curated_crypto_bars` chứa hơn 100,650,539 bản ghi trải dài trên 1,584 phân vùng ngày.
-- **QUY TẮC BẮT BUỘC KHI TRUY VẤN**:
-  - Mọi câu lệnh ad-hoc kiểm tra hoặc `JOIN` phân tích liên sàn (Cross-Exchange Joins) **BẮT BUỘC PHẢI CÓ ĐIỀU KIỆN LỌC PHÂN VÙNG THEO TIMESTAMP**:
+## 2. Memory, Small-File & WSL2 VHDX Protection
+- `lakehouse.bronze.crypto_bars` (`104,706,818` rows, `2,071` files) and `lakehouse.silver.bars` (`104,657,836` rows, `2,058` files) span `1,859+` daily partitions.
+- **Mandatory Query Guardrail**:
+  - Every ad-hoc query or cross-exchange join on `silver.bars` **MUST include a bounded `timestamp` partition filter**:
     ```sql
-    WHERE timestamp >= '2024-09-01 00:00:00' AND timestamp < '2024-09-08 00:00:00'
+    WHERE timestamp >= TIMESTAMP '2026-08-01 00:00:00+00:00'
+      AND timestamp < TIMESTAMP '2026-08-08 00:00:00+00:00'
     ```
-  - **CẢNH BÁO NGUY HIỂM CHẾT NGƯỜI**: Chạy truy vấn không có mệnh đề `WHERE timestamp` trên toàn bộ 100M dòng sẽ kích hoạt hàng nghìn tasks đồng thời trong môi trường Docker tài nguyên hữu hạn, dẫn đến lỗi:
-    - `java.util.concurrent.RejectedExecutionException` (Executor thread pool kiệt quệ).
-    - JVM OutOfMemoryError / Treo toàn bộ Spark container.
+  - Running an unfiltered full-table join across 104M+ rows in Spark will exhaust the JVM thread pool (`RejectedExecutionException`) or trigger OOM.
+- **Python 3.10 PyIceberg Timestamp Rule**:
+  - Inside `lakehouse-spark-iceberg` (Python 3.10), PyIceberg's `datetime.fromisoformat()` rejects trailing `"Z"` on `TimestamptzType` columns. Always normalize ISO timestamps to explicit offset `"+00:00"` (e.g. `2026-11-08T06:00:00+00:00`) via `_normalize_pyiceberg_ts()`.
+- **WSL2 `docker_data.vhdx` Disk Hygiene**:
+  - Never write per-symbol daily files in an outer symbol loop (which creates $68 \times 1,300 = 84,149$ small files per table and bloats `E:\DockerWSL\docker_data.vhdx`). Always batch across all 68 symbols by Quarter (`raw_to_bronze.py`) or Month (`bronze_to_silver.py`).
+  - If large data deletions occur inside Docker volumes, run `fstrim -a -v` inside the Linux VM before running `wsl --shutdown` and `diskpart -> compact vdisk` on Windows.
 
 ---
 
-## 3. Storage Safety & Protected Artifacts (Bảo vệ lưu trữ)
-- **MinIO Object Storage (`s3://warehouse/`)**:
-  - Tuyệt đối không thực hiện xóa xô (bucket deletion) hoặc xóa thư mục hàng loạt trong `s3://warehouse/` nếu không có sự đồng ý rõ ràng của người dùng.
-- **Tài sản Benchmark Được Bảo Vệ**:
-  - Hai bảng dữ liệu kiểm thử nằm tại `warehouse/bronze/`:
-    - `test_spark_clustered`
-    - `test_spark_range`
-  - Đây là 2 bảng dữ liệu đối chứng hiệu năng thực nghiệm. **TUYỆT ĐỐI KHÔNG ĐƯỢC XÓA** trong quá trình bảo trì hay dọn dẹp thư mục.
+## 3. Storage & Filesystem Semantics
+- **Local `./staging` (`staging/canonical`, `staging/confirmed`)**:
+  - Transient local staging buffer only — **NOT** the Data Lakehouse.
+- **MinIO Object Storage (`s3://lakehouse/`)**:
+  - The authoritative physical Data Lakehouse bucket storing `ops/*`, `bronze/*`, and `silver/*`.
+  - Never delete `s3://lakehouse/` without explicit user confirmation.
+  - Keep a backup of the REST Catalog SQLite DB at `staging/iceberg_catalog.db.bak` (`docker cp lakehouse-iceberg-rest:/tmp/iceberg_catalog.db staging/iceberg_catalog.db.bak`).
 
 ---
 
-## 4. Pipeline Idempotency & Replayability Standard (Tính lũy kế an toàn)
-- Mọi pipeline, Airflow DAG, và script ETL phải được thiết kế để có thể chạy lại nhiều lần (Safe Replay) mà không sinh ra sai lệch:
-  1. **Zero-Duplicate Invariant**: Chạy lại cùng một batch incremental phải cho kết quả số dòng trùng lặp bằng 0 (`duplication_count = 0`).
-  2. **ACID MERGE INTO**: Luôn so sánh `priority` và đối chiếu Business Key `(exchange, raw_symbol, timestamp)` khi cập nhật.
-  3. **DDL Scripting**: Luôn dùng cú pháp `CREATE OR REPLACE VIEW` hoặc `CREATE TABLE IF NOT EXISTS`.
-  4. **Iceberg Snapshot Retention**: Khi chạy thủ tục dọn dẹp `expire_snapshots`, phải luôn giữ lại tối thiểu 2 snapshot (`retain_last = 2`) để bảo đảm an toàn cho các tác vụ đọc đồng thời.
+## 4. Pipeline Idempotency & Replayability Standard
+- Every pipeline script and Airflow DAG must be 100% idempotent on repeated execution:
+  1. **Bronze Per-File SHA-256 Gate**: `raw_to_bronze.py` checks `ops.ingestion_manifest` via `load_ingested_file_hashes()` and skips already-ingested Parquet files unless `--force-replay` is specified.
+  2. **Silver Monthly Checkpoint & Scoped Overwrite**: `bronze_to_silver.py` checks each `YYYY-MM` window in `silver.bars` and skips already-populated months unless `--force-replay` (which performs a scoped `overwrite_filter` for that month).
+  3. **Confirmed Parquet Publisher**: `publish_confirmed_parquet.py` verifies existing per-file SHA-256 hashes in `_manifest.json` before rewriting.
 
 ---
 
 ## 5. Security & Secret Isolation
-- Không bao giờ commit file `.env` hoặc hardcode thông tin nhạy cảm (MinIO Root Password, Postgres Credentials, Alpaca API Keys, Binance Secret Keys) vào repository code hoặc tài liệu markdown.
-- Toàn bộ tham số nhạy cảm phải được truyền qua biến môi trường hoặc Docker Compose environment configs.
+- Never commit `.env` or hardcode credentials (`APCA_API_KEY_ID`, `APCA_API_SECRET_KEY`, MinIO/Postgres passwords) into source files or Markdown documentation.

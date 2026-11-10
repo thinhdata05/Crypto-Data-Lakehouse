@@ -1,76 +1,73 @@
 ---
 description: Financial market conventions, quote currency preservation, stablecoin peg normalization, and OHLCV sanity rules
-globs: ["src/preprocessing/**", "src/spark/**", "sql/**", "src/incremental/**"]
+globs: "src/preprocessing/**, src/pipeline/**, sql/**, src/serving/**"
 ---
 
 # 02. Financial Domain & Currency Standardization Rules
 
-Quy tắc nghiệp vụ thị trường tài chính, xử lý đồng yết giá, rủi ro biến động tỷ giá Stablecoin và chuẩn hóa dữ liệu OHLCV.
+Domain rules governing multi-exchange market microstructure, quote currency preservation, stablecoin de-peg risk, and OHLCV mathematical sanity.
 
 ---
 
 ## 1. Multi-Exchange Liquidity & Pricing Independence
 - **Alpaca Crypto**:
-  - Đồng tiền định giá gốc là Fiat chuẩn (`USD`).
-  - Thanh khoản và sổ lệnh tuân thủ quy chuẩn thị trường tài chính Hoa Kỳ.
+  - Primary quote currency is US Dollar fiat (`USD`, plus selected `USDT`/`USDC` pairs).
+  - Order book depth and matching follow US-regulated crypto venue dynamics.
 - **Binance**:
-  - Đồng tiền định giá chủ đạo là Stablecoin (`USDT`, `USDC`).
-  - Thanh khoản và độ sâu thị trường thuộc mạng lưới giao dịch tiền mã hóa toàn cầu.
-- **Quy tắc phân tích giá**:
-  - Giá của cùng một tài sản cơ sở (ví dụ `BTC`, `ETH`) trên Alpaca và Binance có thể chênh lệch tự nhiên do phí giao dịch, cơ chế khớp lệnh và biến động thanh khoản tức thời.
-  - Tuyệt đối không được xem độ lệch giá giữa 2 sàn là "lỗi dữ liệu" và không được áp đặt giá của sàn này để hiệu chỉnh sàn kia trong các bảng cơ sở.
+  - Primary quote currency is stablecoin (`USDT`, `USDC`, plus `USD`/`TUSD`).
+  - Represents global offshore crypto liquidity (50x+ higher BTC volume than Alpaca).
+- **Pricing Rule**:
+  - Price differences between Alpaca and Binance for the same base asset at the same minute reflect genuine market basis, fee structures, and stablecoin FX rates—never treat cross-exchange price divergence as a data error.
 
 ---
 
-## 2. Quote Currency Preservation in Base Storage (Nguyên tắc bảo toàn kiểm toán)
-- Trong toàn bộ các bảng lưu trữ vật lý của Medallion Architecture:
+## 2. Quote Currency Preservation in Base Physical Tables
+- Across all physical Medallion tables:
   - `lakehouse.bronze.crypto_bars`
-  - `lakehouse.silver.crypto_bars`
-  - `lakehouse.silver.curated_crypto_bars`
-  - `lakehouse.gold.curated_crypto_bars`
-- **QUY TẮC BẮT BUỘC**:
-  - Lưu trữ giá `open`, `high`, `low`, `close` đúng theo đơn vị tiền tệ định giá gốc (`quote_currency`): Alpaca lưu theo `USD`, Binance lưu theo `USDT` hoặc `USDC`.
-  - **TUYỆT ĐỐI CẤM TỰ ĐỘNG NHÂN TỶ GIÁ** để đổi `USDT` thành `USD` trong các bảng vật lý này.
-  - **Lý do kỹ thuật & tài chính**:
-    1. Bất kỳ phép quy đổi nào ở tầng cơ sở đều phá hủy dấu vết kiểm toán (Audit Trail) và làm mất tính trung thực của dữ liệu khớp lệnh gốc.
-    2. Tỷ giá Stablecoin biến động theo từng phút; nếu nhân tỷ giá tĩnh hoặc tỷ giá xấp xỉ sẽ làm sai lệch vĩnh viễn dữ liệu tài chính lịch sử.
+  - `lakehouse.bronze.rt_bars`
+  - `lakehouse.silver.bars`
+  - `lakehouse.gold.agg_daily_crypto_ohlcv`
+- **MANDATORY RULE**:
+  - Store `open`, `high`, `low`, `close` strictly in their native `quote_currency` (`USD`, `USDT`, `USDC`, `TUSD`).
+  - **NEVER multiply or convert `USDT` to `USD` inside base physical tables.**
+  - Rationale: In-flight FX conversion destroys auditability and corrupts historical prices because stablecoin exchange rates (`USDT/USD`, `USDC/USD`) fluctuate every minute.
 
 ---
 
-## 3. Binance Quote Pruning Hierarchy (Thứ tự ưu tiên thanh khoản)
-- Trên Binance, một tài sản cơ sở có thể được niêm yết với nhiều cặp giao dịch (ví dụ: `BTCUSDT`, `BTCUSDC`, `BTCUSD`, `BTCBTC`).
-- Nhằm tránh phân mảnh dữ liệu và trùng lặp không cần thiết, bộ tiền xử lý (`src/preprocessing/binance.py`) áp dụng quy tắc lọc ưu tiên thanh khoản:
-  $$\mathbf{USDT} > \mathbf{USDC} > \mathbf{USD} > \mathbf{BTC}$$
-- Nếu tài sản có cặp với `USDT`, hệ thống chỉ thu thập cặp `USDT` và loại bỏ các cặp còn lại.
+## 3. Primary Quote Currency Pruning Hierarchy
+- To prevent liquidity fragmentation and combinatorial cross-join explosion, the preprocessors (`src/preprocessing/alpaca.py`, `src/preprocessing/binance.py`) select **1 primary quote pair per base asset per exchange**:
+  $$\text{Binance}: \mathbf{USDT} > \mathbf{USDC} > \mathbf{USD} > \mathbf{BTC} \quad\mid\quad \text{Alpaca}: \mathbf{USD} > \mathbf{USDT} > \mathbf{USDC}$$
+- Result: Exactly **34 symbols on Alpaca + 34 symbols on Binance = 68 canonical symbol pairs**.
+- **Raw Symbol Formatting Invariant**:
+  - Alpaca `raw_symbol` in storage is normalized with an underscore (e.g., `BTC_USD`, `ETH_USD`, `AAVE_USD`) via `clean_raw_symbol(sym).replace("/", "_")` in both `alpaca.py` and `rest_fetcher.py`.
+  - Binance `raw_symbol` is stored concatenated (e.g., `BTCUSDT`, `ETHUSDT`).
 
 ---
 
-## 4. Normalized Currency Conversion at Serving Layer (Chuẩn hóa tỷ giá tầng phục vụ)
-- Việc quy đổi tiền tệ để tính toán chênh lệch giá (Cross-Exchange Arbitrage Spread) **CHỈ ĐƯỢC PHÉP THỰC HIỆN Ở TẦNG SERVING (VIEW / ANALYTICS)**:
-  - **View `lakehouse.gold.v_fiat_stablecoin_rates`**: Cung cấp chuỗi tỷ giá phút/ngày giữa `USDT-USD` và `USDC-USD`.
-  - **View `lakehouse.gold.v_daily_cross_exchange_normalized_spread`** (hoặc bounded API `src/serving/query_minute_spread.py` cho cấp phút): Thực hiện chuẩn hóa giá Binance về USD trước khi so sánh với Alpaca:
+## 4. Normalized Currency Conversion at the Serving Layer
+- Cross-exchange currency normalization is performed **exclusively at the Serving Layer**:
+  - **View `lakehouse.gold.v_fiat_stablecoin_rates`**: Extracts daily/minute `USDT-USD` and `USDC-USD` conversion rates from `silver.bars`.
+  - **View `lakehouse.gold.v_daily_cross_exchange_normalized_spread`** and **Bounded Minute API `src/serving/query_minute_spread.py`**:
     $$\text{normalized\_binance\_close} = \text{binance\_close} \times \text{coalesce(usdt\_usd\_rate, 1.0)}$$
     $$\text{normalized\_spread\_usd} = \text{alpaca\_close} - \text{normalized\_binance\_close}$$
-    $$\text{normalized\_spread\_bps} = \left(\frac{\text{normalized\_spread\_usd}}{\text{alpaca\_close}}\right) \times 10,000$$
-- **Rủi ro De-peg**: Khi xảy ra sự kiện thiên nga đen (ví dụ USDT tụt xuống 0.95 USD hoặc USDC de-peg về 0.88 USD), công thức chuẩn hóa này phản ánh chính xác cơ hội kinh doanh chênh lệch giá thực tế, thay vì tạo ra tín hiệu giả mạo do giả định sai $1\text{ USDT} = 1\text{ USD}$.
+    $$\text{normalized\_spread\_pct} = \left(\frac{\text{normalized\_spread\_usd}}{\text{normalized\_binance\_close}}\right) \times 100$$
 
 ---
 
-## 5. OHLCV Data Quality & Sanity Rules
-- Mỗi thanh nến 1 phút (1-minute bar) khi nạp vào Silver bắt buộc phải vượt qua bộ kiểm tra tính nhất quán toán học OHLCV:
+## 5. 7-Rule OHLCV Mathematical Sanity Contract
+- Every 1-minute bar admitted into `lakehouse.silver.bars` must satisfy all 7 OHLCV predicates (`OHLCV_SANITY_SQL_PREDICATE` in `src/preprocessing/normalizer.py`, `src/pipeline/silver/bronze_to_silver.py`, and `src/pipeline/quality/data_validation.py`):
   1. $\text{high} \ge \text{low}$
   2. $\text{high} \ge \text{open}$
   3. $\text{high} \ge \text{close}$
   4. $\text{low} \le \text{open}$
   5. $\text{low} \le \text{close}$
-  6. $\text{volume} \ge 0$
-  7. $\text{open} > 0 \land \text{high} > 0 \land \text{low} > 0 \land \text{close} > 0$
-- **Hành động**: Các bản ghi không đạt kiểm tra này sẽ bị đánh dấu cờ lỗi `is_valid_sanity = false` tại Silver và **BỊ CHẶN TUYỆT ĐỐI** không được nạp vào `gold.curated_crypto_bars`.
+  6. Non-negative activity: $\text{volume} \ge 0 \land (\text{trade\_count IS NULL} \lor \text{trade\_count} \ge 0)$
+  7. Positive prices: $\text{open} > 0 \land \text{high} > 0 \land \text{low} > 0 \land \text{close} > 0$
+- Records failing any rule (including negative trade count or price envelope violations) are filtered out during the `bronze.crypto_bars` $\to$ `silver.bars` transformation (`48,982` invalid/duplicate rows filtered out of `104,706,818` Bronze rows).
 
 ---
 
-## 6. Temporal Integrity & Nghiêm cấm Synthetic Rows
-- Dữ liệu lịch sử của mỗi symbol bắt đầu chính xác từ thời điểm sàn niêm yết (listing date) trong khoảng $\ge 2021-01-01$ UTC.
-- **Nghiêm cấm tuyệt đối**:
-  - Không tự sinh các dòng giả mạo (synthetic / dummy bars) hoặc forward-fill để lấp đầy những khoảng thời gian trước khi tài sản được niêm yết.
-  - Những phút không có giao dịch (zero trading volume / missing minutes) phải được giữ nguyên trạng thái trống tự nhiên của sổ lệnh.
+## 6. Temporal Integrity & Zero Synthetic Rows
+- Historical data for each symbol begins strictly at its real exchange listing date ($\ge 2021-01-01$ UTC).
+- **Strictly Forbidden**:
+  - Never generate synthetic/dummy bars or forward-fill missing minutes prior to listing or during zero-volume intervals.

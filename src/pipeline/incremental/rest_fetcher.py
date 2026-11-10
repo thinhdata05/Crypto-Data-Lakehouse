@@ -21,7 +21,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")))
 from src.preprocessing.normalizer import (
     CANONICAL_PREPROCESSED_ARROW_SCHEMA,
     CANONICAL_PREPROCESSED_COLUMNS,
@@ -33,7 +33,7 @@ from src.preprocessing.normalizer import (
 
 
 def _load_dotenv_if_present() -> None:
-    env_file = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.env"))
+    env_file = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../.env"))
     if os.path.exists(env_file):
         try:
             with open(env_file, "r", encoding="utf-8") as f:
@@ -154,8 +154,18 @@ def get_approved_universe() -> dict[str, set[str]]:
                 "s3.secret-access-key": s3_secret_key,
             },
         )
-        dim_table = cat.load_table("gold.dim_symbol")
-        arrow_tbl = dim_table.scan().to_arrow()
+        arrow_tbl = None
+        for candidate_tbl in ("ops.ingestion_manifest", "gold.dim_symbol"):
+            try:
+                t = cat.load_table(candidate_tbl)
+                if t.current_snapshot():
+                    arrow_tbl = t.scan(selected_fields=("exchange", "raw_symbol")).to_arrow()
+                    if len(arrow_tbl) > 0:
+                        break
+            except Exception:
+                continue
+        if arrow_tbl is None:
+            return {}
         exchanges = arrow_tbl["exchange"].to_pylist()
         raw_symbols = arrow_tbl["raw_symbol"].to_pylist()
         universe: dict[str, set[str]] = {"binance": set(), "alpaca": set()}
@@ -177,7 +187,12 @@ def run_incremental_fetch(
 ) -> dict:
     batch_id = batch_id or str(uuid.uuid4())
     if not output_dir:
-        output_dir = "/home/iceberg/warehouse_local/staging/canonical" if os.path.exists("/home/iceberg") else "warehouse/staging/canonical"
+        if os.path.exists("/home/iceberg/staging_local"):
+            output_dir = "/home/iceberg/staging_local/canonical"
+        else:
+            output_dir = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "../../../staging/canonical")
+            )
 
     binance_symbols = binance_symbols or ["BTCUSDT", "ETHUSDT"]
     alpaca_symbols = alpaca_symbols or ["BTC_USD", "ETH_USD"]
@@ -265,6 +280,7 @@ def run_incremental_fetch(
                 continue
 
             base, quote, canonical = split_alpaca_symbol(sym)
+            canonical_raw_sym = clean_raw_symbol(sym).replace("/", "_")
             valid_rows = []
             for bar in raw_bars:
                 valid, _ = validate_ohlcv_record(
@@ -274,7 +290,7 @@ def run_incremental_fetch(
                     continue
                 valid_rows.append({
                     "exchange": "alpaca",
-                    "raw_symbol": sym,
+                    "raw_symbol": canonical_raw_sym,
                     "timestamp": bar["timestamp"],
                     "open": bar["open"],
                     "high": bar["high"],
@@ -314,8 +330,8 @@ def run_incremental_fetch(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Incremental REST API Fetcher")
-    parser.add_argument("--binance-symbols", default="AAVEUSDC", help="Comma separated Binance symbols")
-    parser.add_argument("--alpaca-symbols", default="AAVE/USD", help="Comma separated Alpaca symbols")
+    parser.add_argument("--binance-symbols", default="BTCUSDT,ETHUSDT", help="Comma separated Binance symbols")
+    parser.add_argument("--alpaca-symbols", default="BTC_USD,ETH_USD", help="Comma separated Alpaca symbols")
     parser.add_argument("--limit", type=int, default=10, help="Number of bars to fetch")
     parser.add_argument("--output-dir", default=None, help="Output staging directory")
     parser.add_argument("--batch-id", default=None, help="Batch UUID")
